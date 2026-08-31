@@ -2,7 +2,7 @@ import os
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QLineEdit,
                                QScrollArea, QComboBox, QCheckBox, QPushButton, QMessageBox)
 
-from ui_components import CustomSlider, RadioButtonGroup
+from ui_components import RadioButtonGroup
 
 # 尝试导入实际的功能模块
 try:
@@ -37,26 +37,10 @@ class ASRTab(QWidget):
         self.whisperx_size = RadioButtonGroup(['large', 'medium', 'small', 'base', 'tiny'], "WhisperX模型大小", 'large')
         self.scroll_layout.addWidget(self.whisperx_size)
 
-        # 计算设备
-        self.device = RadioButtonGroup(['auto', 'cuda', 'cpu'], "计算设备", 'auto')
-        self.scroll_layout.addWidget(self.device)
-
-        # 批处理大小
-        self.batch_size = CustomSlider(1, 128, 1, "批处理大小 Batch Size", 32)
-        self.scroll_layout.addWidget(self.batch_size)
-
         # 分离多个说话人
         self.separate_speakers = QCheckBox("分离多个说话人")
         self.separate_speakers.setChecked(True)
         self.scroll_layout.addWidget(self.separate_speakers)
-
-        # 最小说话人数
-        self.min_speakers = RadioButtonGroup([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], "最小说话人数", None)
-        self.scroll_layout.addWidget(self.min_speakers)
-
-        # 最大说话人数
-        self.max_speakers = RadioButtonGroup([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], "最大说话人数", None)
-        self.scroll_layout.addWidget(self.max_speakers)
 
         # 执行按钮
         self.run_button = QPushButton("开始识别")
@@ -91,11 +75,7 @@ class ASRTab(QWidget):
                 self.video_folder.text(),
                 self.asr_model.currentText(),
                 self.whisperx_size.value(),
-                self.device.value(),
-                self.batch_size.value(),
                 self.separate_speakers.isChecked(),
-                self.min_speakers.value(),
-                self.max_speakers.value()
             )
             self.status_label.setText(status)
             self.result_detail.setText(str(result_json))

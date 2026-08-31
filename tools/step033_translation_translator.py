@@ -7,10 +7,10 @@ from loguru import logger
 load_dotenv()
 
 def translator_response(messages, to_language = 'zh-CN', translator_server = 'bing'):
-    if '中文' in to_language:
-        to_language = 'zh-CN'
-    elif 'English' in to_language:
-        to_language = 'en'
+    from tools.target_language import translator_code
+    mapped = translator_code(to_language)
+    if mapped:
+        to_language = mapped
     translation = ''
     for retry in range(3):
         try:

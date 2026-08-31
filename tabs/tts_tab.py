@@ -30,7 +30,9 @@ class TTSTab(QWidget):
 
         # 目标语言
         self.target_language = QComboBox()
-        self.target_language.addItems(['中文', 'English', '粤语', 'Japanese', 'Korean', 'Spanish', 'French'])
+        self.target_language.setEditable(False)
+        self.target_language.addItems(['中文', 'English', '粤语', 'Japanese', 'Korean', 'Spanish', 'French',
+                                       'Vietnamese', 'Thai', 'Indonesian', 'Malay', 'Filipino'])
         self.target_language.setCurrentText('中文')
         self.layout.addWidget(QLabel("目标语言"))
         self.layout.addWidget(self.target_language)

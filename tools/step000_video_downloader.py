@@ -1,14 +1,73 @@
+import json
 import os
 import re
-from loguru import logger
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
 import yt_dlp
-import json
+from loguru import logger
+
+_INVISIBLE = dict.fromkeys(map(ord, '\ufeff\u200b\u200c\u200d\u2060'), None)
+_YOUTUBE_HOSTS = {'youtu.be', 'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'}
+_YOUTUBE_ID = re.compile(r'^[\w-]{11}$')
+
+
+class _QuietYtdlpLogger:
+    """Keep yt-dlp off Windows/Gradio stdout; those writes raise Errno 22."""
+
+    def debug(self, msg):
+        text = str(msg)
+        if text.startswith('[debug] '):
+            return
+        logger.debug(text)
+
+    def info(self, msg):
+        logger.info(msg)
+
+    def warning(self, msg):
+        logger.warning(msg)
+
+    def error(self, msg):
+        logger.error(msg)
+
+
 def sanitize_title(title):
     # Only keep numbers, letters, Chinese characters, and spaces
     title = re.sub(r'[^\w\u4e00-\u9fff \d_-]', '', title)
     # Replace multiple spaces with a single space
     title = re.sub(r'\s+', ' ', title)
-    return title
+    return title.strip(' .')
+
+
+def normalize_media_url(url):
+    text = (url or '').strip().strip('"').strip("'").translate(_INVISIBLE)
+    if text.startswith('www.'):
+        text = 'https://' + text
+    parsed = urlparse(text)
+    host = (parsed.hostname or '').lower()
+    if host not in _YOUTUBE_HOSTS:
+        return text
+
+    video_id = None
+    extra = {}
+    path = parsed.path or ''
+    if host == 'youtu.be':
+        video_id = path.strip('/').split('/')[0]
+    elif '/shorts/' in path or '/live/' in path or '/embed/' in path:
+        video_id = path.rstrip('/').split('/')[-1]
+    else:
+        qs = parse_qs(parsed.query)
+        video_id = (qs.get('v') or [None])[0]
+        if qs.get('list'):
+            extra['list'] = qs['list'][0]
+        if qs.get('t'):
+            extra['t'] = qs['t'][0]
+        elif qs.get('start'):
+            extra['t'] = qs['start'][0]
+
+    if not video_id or not _YOUTUBE_ID.match(video_id):
+        return text
+    query = urlencode({'v': video_id, **extra})
+    return urlunparse(('https', 'www.youtube.com', '/watch', '', query, ''))
 
 
 def get_target_folder(info, folder_path):
@@ -23,33 +82,60 @@ def get_target_folder(info, folder_path):
 
     return output_folder
 
+
+def _cookiefile():
+    return 'cookies.txt' if os.path.exists('cookies.txt') else None
+
+
+def _base_ydl_opts(**extra):
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'noprogress': True,
+        'logger': _QuietYtdlpLogger(),
+        'retries': 5,
+        'extractor_retries': 3,
+        'fragment_retries': 5,
+        'socket_timeout': 30,
+        'windowsfilenames': True,
+    }
+    cookie = _cookiefile()
+    if cookie:
+        opts['cookiefile'] = cookie
+    if os.name == 'nt':
+        opts['source_address'] = '0.0.0.0'
+    for key, value in extra.items():
+        if value is not None:
+            opts[key] = value
+    return opts
+
+
 def download_single_video(info, folder_path, resolution='1080p'):
     sanitized_title = sanitize_title(info['title'])
     sanitized_uploader = sanitize_title(info.get('uploader', 'Unknown'))
     upload_date = info.get('upload_date', 'Unknown')
     if upload_date == 'Unknown':
         return None
-    
+
     output_folder = os.path.join(folder_path, sanitized_uploader, f'{upload_date} {sanitized_title}')
     if os.path.exists(os.path.join(output_folder, 'download.mp4')):
         logger.info(f'Video already downloaded in {output_folder}')
         return output_folder
-    
-    resolution = resolution.replace('p', '')
-    ydl_opts = {
-        # 'res': '1080',
-        'format': f'bestvideo[ext=mp4][height<={resolution}]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'writeinfojson': True,
-        'writethumbnail': True,
-        'outtmpl': os.path.join(folder_path, sanitized_uploader, f'{upload_date} {sanitized_title}', 'download'),
-        'ignoreerrors': True,
-        'cookiefile' : 'cookies.txt' if os.path.exists("cookies.txt") else None, # 得到cookies yt-dlp --cookies-from-browser chrome --cookies cookies.txt
-        # 'cookiesfrombrowser': ('chrome', ), # 从chrome浏览器中获取cookie 
-        # 'cookiesfrombrowser': ('firefox', 'default', None, 'Meta') # 从firefox浏览器中获取cookie
-    }
+
+    resolution = str(resolution).replace('p', '')
+    page_url = normalize_media_url(
+        info.get('webpage_url') or info.get('original_url') or info.get('url') or ''
+    )
+    ydl_opts = _base_ydl_opts(
+        format=f'bestvideo[ext=mp4][height<={resolution}]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        writeinfojson=True,
+        writethumbnail=True,
+        outtmpl=os.path.join(output_folder, 'download'),
+        ignoreerrors=True,
+    )
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([info['webpage_url']])
+        ydl.download([page_url])
     logger.info(f'Video downloaded in {output_folder}')
     return output_folder
 
@@ -61,65 +147,49 @@ def download_videos(info_list, folder_path, resolution='1080p'):
 def get_info_list_from_url(url, num_videos):
     if isinstance(url, str):
         url = [url]
+    urls = [normalize_media_url(u) for u in url if u]
 
-    # Download JSON information first
-    ydl_opts = {
-        # 'format': 'b',
-        'None': "b",
-        'dumpjson': True,
-        'playlistend': num_videos,
-        'ignoreerrors': True
-    }
+    try:
+        playlistend = max(1, int(num_videos or 1))
+    except (TypeError, ValueError):
+        playlistend = 1
 
-    # video_info_list = []
+    ydl_opts = _base_ydl_opts(
+        skip_download=True,
+        playlistend=playlistend,
+        ignoreerrors=True,
+    )
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        for u in url:
-            result = ydl.extract_info(u, download=False)
+        for u in urls:
+            try:
+                result = ydl.extract_info(u, download=False)
+            except OSError as e:
+                logger.warning(f'取得影片資訊時發生系統錯誤，改走相容模式重試: {e}')
+                fallback = dict(ydl_opts)
+                fallback.pop('source_address', None)
+                with yt_dlp.YoutubeDL(fallback) as ydl2:
+                    result = ydl2.extract_info(u, download=False)
+            if not result:
+                logger.error(f'無法解析影片資訊: {u}')
+                continue
             if 'entries' in result:
-                # Playlist
-                # video_info_list.extend(result['entries'])
                 for video_info in result['entries']:
-                    yield video_info
+                    if video_info:
+                        yield video_info
             else:
-                # Single video
-                # video_info_list.append(result)
                 yield result
 
-    # return video_info_list
 
-def download_from_url(url, folder_path, resolution='1080p', num_videos=5):
-    resolution = resolution.replace('p', '')
+def download_from_url(url, folder_path, resolution='1080p', num_videos=1):
     if isinstance(url, str):
         url = [url]
-
-    # Download JSON information first
-    ydl_opts = {
-        # 'format': 'b',
-        "None":"b",
-        'dumpjson': True,
-        'playlistend': num_videos,
-        'ignoreerrors': True,
-        'cookies-from-browser': 'chrome'
-    }
-
-    video_info_list = []
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        for u in url:
-            result = ydl.extract_info(u, download=False)
-            # print(result)
-       
-
-            if 'entries' in result:
-                # Playlist
-                video_info_list.extend(result['entries'])
-            else:
-                # Single video
-                video_info_list.append(result)
-        
-    # Now download videos with sanitized titles
+    video_info_list = list(get_info_list_from_url(url, num_videos))
     example_output_folder = download_videos(video_info_list, folder_path, resolution)
-    if os.path.exists(os.path.join(example_output_folder, 'download.info.json')):
-        download_info_json = json.load(open(os.path.join(example_output_folder, 'download.info.json'), 'r', encoding='utf-8'))
+    download_info_json = None
+    info_path = os.path.join(example_output_folder, 'download.info.json')
+    if example_output_folder and os.path.exists(info_path):
+        download_info_json = json.load(open(info_path, 'r', encoding='utf-8'))
     return f"All videos have been downloaded under the {folder_path} folder", os.path.join(example_output_folder, 'download.mp4'), download_info_json
 
 if __name__ == '__main__':

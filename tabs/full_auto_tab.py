@@ -42,9 +42,9 @@ class FullAutoTab(QWidget):
         self.left_layout = QVBoxLayout(self.left_widget)
 
         # 添加视频URL输入框
-        self.video_url_label = QLabel("视频URL")
+        self.video_url_label = QLabel("视频URL 或本機路徑")
         self.video_url = QLineEdit()
-        self.video_url.setPlaceholderText("请输入Youtube或Bilibili的视频、播放列表或频道的URL")
+        self.video_url.setPlaceholderText("網址，或本機影片路徑。也可按下方按鈕選擇檔案。")
         self.video_url.setText("https://www.bilibili.com/video/BV1kr421M7vz/")
 
         # 选择本地视频按钮
@@ -282,10 +282,8 @@ class FullAutoTab(QWidget):
             # 更详细的参数记录
             self.signals.log.emit("-" * 50)
             self.signals.log.emit("处理参数:")
-            self.signals.log.emit(f"下载视频数量: {config.get('video_count', 5)}")
             self.signals.log.emit(f"分辨率: {config.get('resolution', '1080p')}")
             self.signals.log.emit(f"人声分离模型: {config.get('model', 'htdemucs_ft')}")
-            self.signals.log.emit(f"计算设备: {config.get('device', 'auto')}")
             self.signals.log.emit(f"移位次数: {config.get('shifts', 5)}")
             self.signals.log.emit(f"ASR模型: {config.get('asr_method', 'WhisperX')}")
             self.signals.log.emit(f"WhisperX模型大小: {config.get('whisperx_size', 'large')}")
@@ -297,34 +295,30 @@ class FullAutoTab(QWidget):
             self.signals.progress.emit(5, f"{self.progress_steps[0]} (5%)")
 
             # 实际的处理调用
+            def _gui_progress(pct, msg):
+                line = (msg or '').split('\n', 1)[0]
+                try:
+                    self.signals.progress.emit(int(pct or 0), line)
+                except Exception:
+                    self.signals.progress.emit(0, line)
+                self.signals.log.emit(msg or '')
+
             result, video_path = do_everything(
                 config.get('video_folder', 'videos'),  # 使用配置中的参数或默认值
                 url,
-                config.get('video_count', 5),
                 config.get('resolution', '1080p'),
-                config.get('model', 'htdemucs_ft'),
-                config.get('device', 'auto'),
                 config.get('shifts', 5),
-                config.get('asr_model', 'WhisperX'),
-                config.get('whisperx_size', 'large'),
-                config.get('batch_size', 32),
-                config.get('separate_speakers', True),
-                config.get('min_speakers', None),
-                config.get('max_speakers', None),
-                config.get('translation_method', 'LLM'),
-                config.get('target_language_translation', '简体中文'),
-                config.get('tts_method', 'EdgeTTS'),
-                config.get('target_language_tts', '中文'),
-                config.get('edge_tts_voice', 'zh-CN-XiaoxiaoNeural'),
+                config.get('target_language_translation', 'English'),
                 config.get('add_subtitles', True),
                 config.get('speed_factor', 1.00),
                 config.get('frame_rate', 30),
+                config.get('output_resolution', '1080p'),
+                config.get('max_workers', 1),
+                config.get('max_retries', 3),
                 config.get('background_music', None),
                 config.get('bg_music_volume', 0.5),
                 config.get('video_volume', 1.0),
-                config.get('output_resolution', '1080p'),
-                config.get('max_workers', 1),
-                config.get('max_retries', 3)
+                _gui_progress,
             )
 
             # 完成处理，设置100%进度

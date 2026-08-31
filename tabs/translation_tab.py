@@ -5,8 +5,13 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QLineEdit,
 # 尝试导入实际的功能模块
 try:
     from tools.step030_translation import translate_all_transcript_under_folder
+    from tools.target_language import TARGET_LANGUAGES
 except ImportError:
-    pass
+    TARGET_LANGUAGES = [
+        'English', 'Japanese', '越南文', '簡體中文', '繁體中文', '粵語',
+        'Korean（部分支援）', '西班牙文（部分支援）', 'French（部分支援）',
+        '泰文（部分支援）', '印尼文（部分支援）', '馬來文（部分支援）', '菲律賓文（部分支援）',
+    ]
 
 
 class TranslationTab(QWidget):
@@ -28,7 +33,8 @@ class TranslationTab(QWidget):
 
         # 目标语言
         self.target_language = QComboBox()
-        self.target_language.addItems(['简体中文', '繁体中文', 'English', 'Cantonese', 'Japanese', 'Korean'])
+        self.target_language.setEditable(False)
+        self.target_language.addItems(TARGET_LANGUAGES)
         self.layout.addWidget(QLabel("目标语言"))
         self.layout.addWidget(self.target_language)
 

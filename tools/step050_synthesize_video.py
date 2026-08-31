@@ -4,32 +4,39 @@ import os
 import shutil
 import string
 import subprocess
+import threading
 import time
 import random
 import traceback
+from queue import Empty, Queue
 
 from loguru import logger
 
 
 def split_text(input_data,
-               punctuations=['，', '；', '：', '。', '？', '！', '\n', '”']):
-    # Chinese punctuation marks for sentence ending
+               punctuations=['，', '；', '：', '。', '？', '！', '\n', '”', ',', '.', '?', '!', ';', ':']):
+    # Sentence-ending punctuation for Chinese and English subtitles
 
-    # Function to check if a character is a Chinese ending punctuation
     def is_punctuation(char):
         return char in punctuations
 
-    # Process each item in the input data
     output_data = []
     for item in input_data:
         start = item["start"]
-        text = item["translation"]
+        text = item.get("translation") or ''
         speaker = item.get("speaker", "SPEAKER_00")
-        original_text = item["text"]
+        original_text = item.get("text") or ''
+        if not text.strip():
+            output_data.append({
+                "start": round(item["start"], 3),
+                "end": round(item["end"], 3),
+                "text": original_text,
+                "translation": text,
+                "speaker": speaker
+            })
+            continue
         sentence_start = 0
-
-        # Calculate the duration for each character
-        duration_per_char = (item["end"] - item["start"]) / len(text)
+        duration_per_char = (item["end"] - item["start"]) / max(len(text), 1)
         for i, char in enumerate(text):
             # If the character is a punctuation, split the sentence
             if not is_punctuation(char) and i != len(text) - 1:
@@ -63,7 +70,16 @@ def format_timestamp(seconds):
     minutes, seconds = divmod(seconds, 60)
     return f"{hours:02}:{minutes:02}:{seconds:02},{millisec:03}"
 
-def generate_srt(translation, srt_path, speed_up=1, max_line_char=30):
+
+def _escape_ffmpeg_subtitles_path(path):
+    """Escape a Windows path for FFmpeg's subtitles filter (colons, backslashes, spaces)."""
+    path = os.path.abspath(path).replace('\\', '/')
+    path = path.replace(':', r'\:')
+    path = path.replace("'", r"\'")
+    return f"'{path}'"
+
+
+def generate_srt(translation, srt_path, speed_up=1, max_line_char=42):
     translation = split_text(translation)
     with open(srt_path, 'w', encoding='utf-8') as f:
         for i, line in enumerate(translation):
@@ -94,18 +110,204 @@ def convert_resolution(aspect_ratio, resolution='1080p'):
     else:
         height = int(resolution[:-1])
         width = int(height * aspect_ratio)
-    # make sure width and height are divisibal by 2
     width = width - width % 2
     height = height - height % 2
-    
-    # return f'{width}x{height}'
     return width, height
-    
+
+
+def _srt_copy_for_ffmpeg(srt_path):
+    temp_dir = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'Temp', 'linly-dubbing')
+    try:
+        os.makedirs(temp_dir, exist_ok=True)
+    except OSError:
+        temp_dir = 'temp'
+        os.makedirs(temp_dir, exist_ok=True)
+    dest = os.path.join(temp_dir, f'sub_{os.getpid()}.srt')
+    shutil.copyfile(srt_path, dest)
+    return dest
+
+
+def _video_encoder_args():
+    return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p']
+
+
+def _ffmpeg_output_path(command):
+    for item in reversed(command or []):
+        text = str(item)
+        if text.endswith(('.mp4', '.mkv', '.webm', '.mov', '.wav', '.m4a')):
+            return text
+    return None
+
+
+def _output_is_complete(path, duration):
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        if os.path.getsize(path) < 10000:
+            return False
+    except OSError:
+        return False
+    if not duration or duration <= 1:
+        return True
+    try:
+        from tools.audio_chunks import media_duration
+        got = media_duration(path)
+    except Exception:
+        return False
+    return got >= float(duration) * 0.97
+
+
+def _newer(path, than):
+    try:
+        return os.path.isfile(path) and os.path.getmtime(path) > os.path.getmtime(than) + 1
+    except OSError:
+        return False
+
+
+def _mux_is_current(folder, final_video, duration):
+    if not _output_is_complete(final_video, duration):
+        return False
+    for name in ('audio_combined.wav', 'translation.json', 'download.mp4'):
+        if _newer(os.path.join(folder, name), final_video):
+            return False
+    return True
+
+
+def _swap_output_path(command, new_path):
+    cmd = list(command)
+    old = _ffmpeg_output_path(cmd)
+    if old:
+        for i in range(len(cmd) - 1, -1, -1):
+            if str(cmd[i]) == old:
+                cmd[i] = new_path
+                break
+    return cmd
+
+
+def _finish_mux_file(tmp_path, final_path, duration):
+    if tmp_path and os.path.isfile(tmp_path) and _output_is_complete(tmp_path, duration):
+        os.replace(tmp_path, final_path)
+        return True
+    if _output_is_complete(final_path, duration):
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return True
+    return False
+
+
+def _run_ffmpeg(command, what='FFmpeg', duration=None):
+    from tools.cost_tracker import mark_stage
+    from tools.job_control import JobStopped, is_stopped
+
+    cmd = list(command)
+    final_path = _ffmpeg_output_path(cmd)
+    tmp_path = f'{final_path}.muxing.mp4' if final_path else None
+    if tmp_path:
+        cmd = _swap_output_path(cmd, tmp_path)
+    if cmd and str(cmd[0]).lower().endswith('ffmpeg'):
+        cmd[1:1] = ['-nostdin', '-loglevel', 'error', '-progress', 'pipe:1', '-nostats', '-hide_banner']
+    logger.info(f'{what}: {" ".join(str(x) for x in cmd)}')
+    # Never pipe stderr: libass subtitle logs fill the Windows 64KB pipe and deadlock ffmpeg.
+    popen_kw = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if os.name == 'nt':
+        popen_kw['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    proc = subprocess.Popen(cmd, **popen_kw)
+    lines = Queue()
+
+    def _read_stdout():
+        buf = b''
+        try:
+            stream = proc.stdout
+            while stream:
+                chunk = stream.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+                while b'\n' in buf:
+                    raw, buf = buf.split(b'\n', 1)
+                    lines.put(raw.decode('utf-8', 'replace'))
+        except Exception:
+            pass
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=_read_stdout, name='ffmpeg-stdout', daemon=True).start()
+    seconds = 0.0
+    last_report = 0.0
+    last_line_at = time.time()
+    stalled = False
+    try:
+        while True:
+            if is_stopped():
+                proc.kill()
+                raise JobStopped('已中止')
+            try:
+                raw = lines.get(timeout=1.0)
+            except Empty:
+                if proc.poll() is not None and lines.empty():
+                    break
+                idle = time.time() - last_line_at
+                near_end = duration and duration > 1 and seconds >= duration * 0.95
+                if idle > (20 if near_end else 90):
+                    logger.error(f'{what} 超過 {20 if near_end else 90} 秒沒有進度，中止以免卡在最後 1%')
+                    stalled = True
+                    proc.kill()
+                    break
+                continue
+            if raw is None:
+                break
+            last_line_at = time.time()
+            line = (raw or '').strip()
+            if line.startswith('out_time_ms='):
+                try:
+                    seconds = max(0.0, int(line.split('=', 1)[1]) / 1_000_000)
+                except ValueError:
+                    continue
+            now = time.time()
+            if now - last_report < 1.5:
+                continue
+            last_report = now
+            if duration and duration > 1:
+                frac = min(1.0, seconds / duration)
+                mark_stage(f'影片合成中 {seconds:.0f}/{duration:.0f} 秒', 90 + 9 * frac)
+                logger.info(f'{what} {seconds:.0f}/{duration:.0f}s')
+            else:
+                mark_stage(f'影片合成中 {seconds:.0f} 秒', 92)
+        try:
+            code = proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            code = proc.wait()
+            stalled = True
+    except JobStopped:
+        if proc.poll() is None:
+            proc.kill()
+        raise
+    if code == 0 and _finish_mux_file(tmp_path, final_path, duration or 0):
+        return True
+    if _finish_mux_file(tmp_path, final_path, duration):
+        logger.warning(f'{what} 行程異常結束，但輸出檔已完整，視為成功: {final_path}')
+        return True
+    if tmp_path and os.path.isfile(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    if stalled:
+        logger.error(f'{what} 卡住後輸出不完整')
+        return False
+    logger.error(f'{what} 失敗')
+    return False
+
+
 def synthesize_video(folder, subtitles=True, speed_up=1.00, fps=30, resolution='1080p', background_music=None, watermark_path=None, bgm_volume=0.5, video_volume=1.0):
-    # if os.path.exists(os.path.join(folder, 'video.mp4')):
-    #     logger.info(f'Video already synthesized in {folder}')
-    #     return
-    
     translation_path = os.path.join(folder, 'translation.json')
     input_audio = os.path.join(folder, 'audio_combined.wav')
     input_video = os.path.join(folder, 'download.mp4')
@@ -115,97 +317,124 @@ def synthesize_video(folder, subtitles=True, speed_up=1.00, fps=30, resolution='
     
     with open(translation_path, 'r', encoding='utf-8') as f:
         translation = json.load(f)
-        
+
     srt_path = os.path.join(folder, 'subtitles.srt')
     final_video = os.path.join(folder, 'video.mp4')
+    duration = None
+    try:
+        from tools.audio_chunks import media_duration
+        duration = media_duration(input_video)
+    except Exception:
+        duration = None
+    if subtitles and _mux_is_current(folder, final_video, duration):
+        logger.info(f'影片已合成且音訊未更新，跳過重燒: {final_video}')
+        return final_video
     generate_srt(translation, srt_path, speed_up)
-    srt_path = srt_path.replace('\\', '/')
     aspect_ratio = get_aspect_ratio(input_video)
     width, height = convert_resolution(aspect_ratio, resolution)
-    resolution = f'{width}x{height}'
-    font_size = int(width/128)
-    outline = int(round(font_size/8))
-    video_speed_filter = f"setpts=PTS/{speed_up}"
-    audio_speed_filter = f"atempo={speed_up}"
-    font_path = "./font/SimHei.ttf"
-    subtitle_filter = f"subtitles={srt_path}:fontsdir={os.path.dirname(font_path)}:force_style='FontName=SimHei,FontSize={font_size},PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline={outline},WrapStyle=2'"
-    # subtitle_filter = f"subtitles={srt_path}:force_style='FontName=Arial,FontSize={font_size},PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline={outline},WrapStyle=2'"
+    font_size = int(width / 128)
+    outline = int(round(font_size / 8))
+    speed_up = float(speed_up or 1.0)
+    need_speed = abs(speed_up - 1.0) > 0.001
+    srt_temp = None
+    started = time.time()
 
-    filter_complex = f"[0:v]{video_speed_filter}[v];[1:a]{audio_speed_filter}[a]"
-        
-    # Add watermark if specified
-    if watermark_path:
-        watermark_filter = f";[2:v]scale=iw*0.15:ih*0.15[wm];[v][wm]overlay=W-w-10:H-h-10[v]"
-        ffmpeg_command = [
-            'ffmpeg',
-            '-i', input_video,
-            '-i', input_audio,
-            '-i', watermark_path,
-            '-filter_complex', filter_complex + watermark_filter,
-            '-map', '[v]',
-            '-map', '[a]',
-            '-r', str(fps),
-            '-s', resolution,
-            '-c:v', 'libx264',
-            '-c:a', 'aac',
-            final_video,
-            '-y',
-            '-threads', '2',
-        ]
-    else:
-        ffmpeg_command = [
-            'ffmpeg',
-            '-i', input_video,
-            '-i', input_audio,
-            '-filter_complex', filter_complex,
-            '-map', '[v]',
-            '-map', '[a]',
-            '-r', str(fps),
-            '-s', resolution,
-            '-c:v', 'libx264',
-            '-c:a', 'aac',
-            final_video,
-            '-y',
-            '-threads', '2',
-        ]
-    subprocess.run(ffmpeg_command)
-    time.sleep(1)
-
-    # Apply background music if specified
-    if background_music:
-        final_video_with_bgm = final_video.replace('.mp4', '_bgm.mp4')
-        ffmpeg_command_bgm = [
-            'ffmpeg',
-            '-i', final_video,                # Original video with audio
-            '-i', background_music,           # Background music
-            '-filter_complex', f'[0:a]volume={video_volume}[v0];[1:a]volume={bgm_volume}[v1];[v0][v1]amix=inputs=2:duration=first[a]',
-            '-map', '0:v',                    # Use video from the original input
-            '-map', '[a]',                    # Use the mixed audio
-            '-c:v', 'copy',                       # Copy the original video codec
-            '-c:a', 'aac',                    # Encode the audio as AAC
-            final_video_with_bgm,
-            '-y',
-            '-threads', '2'
-        ]
-        subprocess.run(ffmpeg_command_bgm)
-        os.remove(final_video)
-        os.rename(final_video_with_bgm, final_video)
-        time.sleep(1)
-    # 字幕无所谓，所以直接try catch就好
     try:
-        if subtitles:
-            final_video_with_subtitles = final_video.replace('.mp4', '_subtitles.mp4')
-            add_subtitles(final_video, srt_path, final_video_with_subtitles, subtitle_filter, 'ffmpeg')
-            # os.remove(final_video)
-            if os.path.exists(final_video):
-                os.remove(final_video)
-            os.rename(final_video_with_subtitles, final_video)
-            time.sleep(1)
-    except Exception as e:
-        logger.info(f"An error occurred: {e}")
-        traceback.format_exc()
+        video_steps = []
+        if need_speed:
+            video_steps.append(f'setpts=PTS/{speed_up}')
+        video_steps.append(f'scale={width}:{height}')
+        video_steps.append(f'fps={int(fps)}')
 
-    return final_video
+        inputs = ['-i', input_video, '-i', input_audio]
+        next_idx = 2
+        wm_idx = None
+        bgm_idx = None
+        if watermark_path:
+            inputs += ['-i', watermark_path]
+            wm_idx = next_idx
+            next_idx += 1
+        if background_music:
+            inputs += ['-i', background_music]
+            bgm_idx = next_idx
+
+        video_out = '[v]' if not subtitles and wm_idx is None else '[v0]'
+        graph = [f"[0:v]{','.join(video_steps)}{video_out}"]
+        vlabel = video_out
+        if wm_idx is not None:
+            video_out = '[v]' if not subtitles else '[v1]'
+            graph.append(f'[{wm_idx}:v]scale=iw*0.15:ih*0.15[wm]')
+            graph.append(f'{vlabel}[wm]overlay=W-w-10:H-h-10{video_out}')
+            vlabel = video_out
+
+        if subtitles:
+            srt_temp = _srt_copy_for_ffmpeg(srt_path)
+            srt_escaped = _escape_ffmpeg_subtitles_path(srt_temp)
+            style = (
+                f"FontName=Arial,FontSize={font_size},PrimaryColour=&HFFFFFF,"
+                f"OutlineColour=&H000000,Outline={outline},WrapStyle=2"
+            )
+            graph.append(f"{vlabel}subtitles={srt_escaped}:force_style='{style}'[v]")
+
+        audio_map = '1:a'
+        if need_speed and bgm_idx is not None:
+            graph.append(f'[1:a]atempo={speed_up},volume={video_volume}[va]')
+            graph.append(f'[{bgm_idx}:a]volume={bgm_volume}[ba]')
+            graph.append('[va][ba]amix=inputs=2:duration=first[a]')
+            audio_map = '[a]'
+        elif need_speed:
+            graph.append(f'[1:a]atempo={speed_up}[a]')
+            audio_map = '[a]'
+        elif bgm_idx is not None:
+            graph.append(f'[1:a]volume={video_volume}[va]')
+            graph.append(f'[{bgm_idx}:a]volume={bgm_volume}[ba]')
+            graph.append('[va][ba]amix=inputs=2:duration=first[a]')
+            audio_map = '[a]'
+
+        command = [
+            'ffmpeg', '-y', '-threads', '0',
+            *inputs,
+            '-filter_complex', ';'.join(graph),
+            '-map', '[v]',
+            '-map', audio_map,
+            *_video_encoder_args(),
+            '-c:a', 'aac', '-b:a', '192k',
+            final_video,
+        ]
+        if duration and duration > 1:
+            command[-1:-1] = ['-t', f'{duration:.3f}']
+            logger.info(f'開始合成影片，片長約 {duration:.0f} 秒')
+            from tools.cost_tracker import mark_stage
+            mark_stage(f'影片合成中 0/{duration:.0f} 秒', 90)
+        ok = _run_ffmpeg(command, '一次合成影片', duration=duration)
+        if not ok and subtitles:
+            logger.warning('含字幕一次合成失敗，改為先無字幕再燒字幕')
+            plain = synthesize_video(
+                folder, subtitles=False, speed_up=speed_up, fps=fps, resolution=resolution,
+                background_music=background_music, watermark_path=watermark_path,
+                bgm_volume=bgm_volume, video_volume=video_volume,
+            )
+            if not plain or not os.path.exists(plain):
+                return None
+            subtitled = final_video.replace('.mp4', '_subtitles.mp4')
+            burned = add_subtitles(plain, srt_path, subtitled, method='ffmpeg')
+            if burned and os.path.exists(subtitled):
+                os.replace(subtitled, final_video)
+            else:
+                logger.warning('字幕燒錄失敗，保留無字幕配音影片')
+        elif not ok:
+            return None
+        if not os.path.exists(final_video):
+            logger.error(f'合成影片未生成: {final_video}')
+            return None
+        logger.info(f'影片合成完成，用時 {time.time() - started:.1f}s: {final_video}')
+        return final_video
+    finally:
+        if srt_temp and os.path.exists(srt_temp):
+            try:
+                os.remove(srt_temp)
+            except OSError:
+                pass
 
 
 def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, method='ffmpeg'):
@@ -223,10 +452,13 @@ def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, metho
         bool: 成功返回 True，失败返回 False。
     """
     try:
-        # 确保temp目录存在
-        temp_dir = "temp"
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
+        # Prefer a space-free temp dir so FFmpeg's subtitles filter can parse the path
+        temp_dir = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'Temp', 'linly-dubbing')
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+        except OSError:
+            temp_dir = "temp"
+            os.makedirs(temp_dir, exist_ok=True)
 
         # 生成随机字符串作为临时文件名
         random_string = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
@@ -299,26 +531,24 @@ def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, metho
                 font_dir = os.path.abspath("./font")
 
                 # 构建字幕过滤器，使用文件名引用
-                style = "FontName=SimHei,FontSize=15,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,WrapStyle=2"
-                filter_option = f"subtitles={temp_srt_path}:force_style='{style}'"
+                style = "FontName=Arial,FontSize=18,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,WrapStyle=2"
+                srt_escaped = _escape_ffmpeg_subtitles_path(temp_srt_path)
+                filter_option = f"subtitles={srt_escaped}:force_style='{style}'"
 
-                # 构建命令
                 command = [
                     'ffmpeg',
-                    '-i', f"{temp_video_path}",
-                    '-vf', f"{filter_option}",
-                    '-c:a', 'copy',
-                    f"{temp_output_path}",
                     '-y',
-                    '-threads', '2',
+                    '-threads', '0',
+                    '-i', temp_video_path,
+                    '-vf', filter_option,
+                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+                    '-c:a', 'copy',
+                    temp_output_path,
                 ]
 
                 logger.info(f"执行FFmpeg命令: {' '.join(command)}")
-
-                # 执行命令
-                result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stderr_output = result.stderr.decode('utf-8', errors='ignore')
-                logger.debug(f"FFmpeg输出: {stderr_output}")
+                if not _run_ffmpeg(command, '燒錄字幕'):
+                    raise subprocess.CalledProcessError(1, command)
 
                 # 检查是否成功生成输出文件
                 if os.path.exists(temp_output_path):
@@ -364,7 +594,7 @@ def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, metho
                 except Exception as e:
                     logger.debug(f"无法删除临时文件 {temp_file}: {e}")
 
-def synthesize_all_video_under_folder(folder, subtitles=True, speed_up=1.00, fps=30, background_music=None, bgm_volume=0.5, video_volume=1.0, resolution='1080p', watermark_path="f_logo.png"):
+def synthesize_all_video_under_folder(folder, subtitles=True, speed_up=1.00, fps=30, resolution='1080p', background_music=None, bgm_volume=0.5, video_volume=1.0, watermark_path="f_logo.png"):
     watermark_path = None if not os.path.exists(watermark_path) else watermark_path
     output_video = None
     for root, dirs, files in os.walk(folder):

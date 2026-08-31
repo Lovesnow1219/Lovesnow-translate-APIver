@@ -1,23 +1,142 @@
 import json
 import os
+import queue
+import re
+import shutil
+import subprocess
+import threading
 import time
 import traceback
 
-import torch
 from loguru import logger
-from .step000_video_downloader import get_info_list_from_url, download_single_video, get_target_folder
+
+VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.flv', '.mpeg', '.mpg')
+
+
+def _as_path(value):
+    if value is None or value is False:
+        return None
+    if isinstance(value, dict):
+        value = value.get('path') or value.get('name') or value.get('orig_name')
+    value = str(value).strip().strip('"').strip("'")
+    return value or None
+
+
+def is_url_source(text):
+    text = (text or '').strip()
+    lowered = text.lower()
+    return lowered.startswith(('http://', 'https://', 'www.')) or 'bilibili.com' in lowered or 'youtube.com' in lowered or 'youtu.be' in lowered
+
+
+def looks_like_local_video(text):
+    path = _as_path(text)
+    if not path or is_url_source(path):
+        return False
+    ext = os.path.splitext(path)[1].lower()
+    if os.path.isdir(path):
+        return True
+    if ext in VIDEO_EXTS:
+        return True
+    if re.match(r'^[a-zA-Z]:[\\/]', path) or path.startswith('\\\\') or path.startswith('./') or path.startswith('.\\'):
+        return os.path.exists(path)
+    return os.path.isfile(path)
+
+
+def collect_jobs(url, local_file=None):
+    jobs = []
+    uploaded = _as_path(local_file)
+    if uploaded:
+        jobs.append(('local', uploaded))
+    text = (url or '').strip()
+    if not text:
+        return jobs
+    for chunk in re.split(r'[\n\r，]+', text):
+        chunk = chunk.strip().strip('"').strip("'")
+        if not chunk:
+            continue
+        if looks_like_local_video(chunk):
+            jobs.append(('local', chunk))
+        else:
+            jobs.append(('url', normalize_media_url(chunk)))
+    return jobs
+
+
+def _copy_as_download_mp4(src, dest):
+    if os.path.abspath(src) == os.path.abspath(dest):
+        return dest
+    ext = os.path.splitext(src)[1].lower()
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if ext == '.mp4':
+        shutil.copy2(src, dest)
+        return dest
+    copy = subprocess.run(
+        ['ffmpeg', '-y', '-i', src, '-c', 'copy', '-movflags', '+faststart', dest],
+        capture_output=True, text=True, check=False,
+    )
+    if copy.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        return dest
+    transcode = subprocess.run(
+        ['ffmpeg', '-y', '-i', src, '-c:v', 'libx264', '-c:a', 'aac', '-movflags', '+faststart', dest],
+        capture_output=True, text=True, check=False,
+    )
+    if transcode.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        return dest
+    shutil.copy2(src, dest)
+    return dest
+
+
+def prepare_local_video(src, root_folder, preferred_name=None):
+    src = os.path.abspath(os.path.expanduser(_as_path(src)))
+    if os.path.isdir(src):
+        found = None
+        for name in ('download.mp4', 'video.mp4'):
+            cand = os.path.join(src, name)
+            if os.path.isfile(cand):
+                found = cand
+                break
+        if found is None:
+            for name in os.listdir(src):
+                if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                    found = os.path.join(src, name)
+                    break
+        if found is None:
+            raise FileNotFoundError(f'資料夾裡找不到影片: {src}')
+        src = found
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f'找不到本地影片: {src}')
+
+    folder = os.path.dirname(src)
+    base = os.path.basename(preferred_name or src)
+    if os.path.basename(src) in ('download.mp4', 'video.mp4'):
+        dest = os.path.join(folder, 'download.mp4')
+        if os.path.abspath(src) != os.path.abspath(dest):
+            _copy_as_download_mp4(src, dest)
+        logger.info(f'使用本地影片資料夾: {folder}')
+        return dest
+
+    stem = os.path.splitext(base)[0] or 'local_video'
+    new_folder = os.path.join(root_folder, stem)
+    os.makedirs(new_folder, exist_ok=True)
+    dest = os.path.join(new_folder, 'download.mp4')
+    _copy_as_download_mp4(src, dest)
+    logger.info(f'已準備本地影片: {src} -> {dest}')
+    return dest
+
+
+from .step000_video_downloader import (
+    download_single_video,
+    get_info_list_from_url,
+    get_target_folder,
+    normalize_media_url,
+)
 from .step010_demucs_vr import separate_all_audio_under_folder, init_demucs, release_model
 from .step020_asr import transcribe_all_audio_under_folder
-from .step021_asr_whisperx import init_whisperx, init_diarize
-from .step022_asr_funasr import init_funasr
 from .step030_translation import translate_all_transcript_under_folder
 from .step040_tts import generate_all_wavs_under_folder
-from .step042_tts_xtts import init_TTS
-from .step043_tts_cosyvoice import init_cosyvoice
 from .step050_synthesize_video import synthesize_all_video_under_folder
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
-# 跟踪模型初始化状态
+# 追蹤模型初始化狀態
 models_initialized = {
     'demucs': False,
     'xtts': False,
@@ -28,48 +147,48 @@ models_initialized = {
 }
 
 
-def get_available_gpu_memory():
-    """获取当前可用的GPU显存大小（GB）"""
-    try:
-        if torch.cuda.is_available():
-            # 获取当前设备的可用显存
-            free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
-            return free_memory / (1024 ** 3)  # 转换为GB
-        return 0  # 如果没有GPU或CUDA不可用
-    except Exception:
-        return 0  # 出错时返回0
-
-
 def initialize_models(tts_method, asr_method, diarization):
     """
     初始化所需的模型。
-    只在第一次调用时初始化模型，避免重复加载。
+    只在第一次呼叫時初始化模型，避免重複載入。
     """
-    # 使用全局状态跟踪已初始化的模型
+    # 使用全域狀態追蹤已初始化的模型
     global models_initialized
 
     with ThreadPoolExecutor() as executor:
         try:
-            # Demucs模型初始化
-            if not models_initialized['demucs']:
+            from .step011_replicate_demucs import use_replicate
+            # Demucs：有 Replicate token 時走雲端 API，不載入本機模型
+            if use_replicate('Replicate'):
+                logger.info("人聲分離使用 Replicate API，跳過本機 Demucs")
+            elif not models_initialized['demucs']:
                 executor.submit(init_demucs)
                 models_initialized['demucs'] = True
                 logger.info("Demucs模型初始化完成")
             else:
-                logger.info("Demucs模型已初始化，跳过")
+                logger.info("Demucs模型已初始化，跳過")
 
-            # TTS模型初始化
+            # TTS模型初始化（API 模式不需本機模型）
             if tts_method == 'xtts' and not models_initialized['xtts']:
+                from .step042_tts_xtts import init_TTS
                 executor.submit(init_TTS)
                 models_initialized['xtts'] = True
                 logger.info("XTTS模型初始化完成")
             elif tts_method == 'cosyvoice' and not models_initialized['cosyvoice']:
+                from .step043_tts_cosyvoice import init_cosyvoice
                 executor.submit(init_cosyvoice)
                 models_initialized['cosyvoice'] = True
                 logger.info("CosyVoice模型初始化完成")
+            elif tts_method in ('EdgeTTS', 'OpenAI', 'Fish'):
+                logger.info(f"TTS 使用 API: {tts_method}，跳過本機模型")
 
             # ASR模型初始化
-            if asr_method == 'WhisperX':
+            if asr_method == 'OpenAI':
+                logger.info("ASR 使用 OpenAI 雲端辨識 API，跳過本機模型")
+            elif asr_method in ('通義千問', '通义千问', 'Qwen', '阿里雲-通義千問', '阿里云-通义千问'):
+                logger.info("ASR 使用通義千問雲端辨識 API，跳過本機模型")
+            elif asr_method == 'WhisperX':
+                from .step021_asr_whisperx import init_whisperx, init_diarize
                 if not models_initialized['whisperx']:
                     executor.submit(init_whisperx)
                     models_initialized['whisperx'] = True
@@ -79,16 +198,17 @@ def initialize_models(tts_method, asr_method, diarization):
                     models_initialized['diarize'] = True
                     logger.info("Diarize模型初始化完成")
             elif asr_method == 'FunASR' and not models_initialized['funasr']:
+                from .step022_asr_funasr import init_funasr
                 executor.submit(init_funasr)
                 models_initialized['funasr'] = True
                 logger.info("FunASR模型初始化完成")
 
         except Exception as e:
             stack_trace = traceback.format_exc()
-            logger.error(f"初始化模型失败: {str(e)}\n{stack_trace}")
-            # 出现错误时，重置初始化状态
+            logger.error(f"初始化模型失敗: {str(e)}\n{stack_trace}")
+            # 出現錯誤時，重設初始化狀態
             models_initialized = {key: False for key in models_initialized}
-            release_model()  # 释放已加载的模型
+            release_model()  # 釋放已載入的模型
             raise
 
 
@@ -98,315 +218,426 @@ def process_video(info, root_folder, resolution,
                   translation_method, translation_target_language,
                   tts_method, tts_target_language, voice,
                   subtitles, speed_up, fps, background_music, bgm_volume, video_volume,
-                  target_resolution, max_retries, progress_callback=None):
+                  target_resolution, max_retries, progress_callback=None,
+                  force_retranslate=False, force_redub=False):
     """
-    处理单个视频的完整流程，增加了进度回调函数
+    處理單個影片的完整流程，增加了進度回呼函式
 
     Args:
-        progress_callback: 回调函数，用于报告进度和状态，格式为 progress_callback(progress_percent, status_message)
+        progress_callback: 回呼函式，用於回報進度和狀態，格式為 progress_callback(progress_percent, status_message)
     """
     local_time = time.localtime()
 
-    # 定义进度阶段和权重
+    # 定義進度階段和權重
     stages = [
-        ("下载视频...", 10),  # 10%
-        ("人声分离...", 15),  # 15%
-        ("AI智能语音识别...", 20),  # 20%
-        ("字幕翻译...", 25),  # 25%
-        ("AI语音合成...", 20),  # 20%
-        ("视频合成...", 10)  # 10%
+        ("下載影片...", 10),  # 10%
+        ("人聲分離...", 15),  # 15%
+        ("AI智慧語音識別...", 20),  # 20%
+        ("字幕翻譯...", 25),  # 25%
+        ("AI語音合成...", 20),  # 20%
+        ("影片合成...", 10)  # 10%
     ]
 
     current_stage = 0
     progress_base = 0
 
-    # 报告初始进度
-    if progress_callback:
-        progress_callback(0, "准备处理...")
+    from tools.cost_tracker import begin_session, finish_session, mark_stage
+    from tools.job_control import JobStopped, check_stop
+    begin_session(progress_cb=progress_callback)
+    mark_stage('準備處理...', 0)
+    try:
+        for retry in range(max_retries):
+            current_stage = 0
+            progress_base = 0
+            try:
+                check_stop()
+                is_local = isinstance(info, str) and os.path.isfile(info)
+                stage_name, stage_weight = stages[current_stage]
+                if is_local:
+                    stage_name = '準備本地影片...'
+                mark_stage(stage_name, progress_base)
 
-    for retry in range(max_retries):
-        try:
-            # 报告进入下载阶段
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
+                if is_local:
+                    folder = os.path.dirname(info)
+                else:
+                    folder = get_target_folder(info, root_folder)
+                    if folder is None:
+                        error_msg = f'無法取得影片目標資料夾: {info["title"]}'
+                        logger.warning(error_msg)
+                        return False, None, error_msg
 
-            if isinstance(info, str) and info.endswith('.mp4'):
-                folder = os.path.dirname(info)
-                # os.rename(info, os.path.join(folder, 'download.mp4'))
-            else:
-                folder = get_target_folder(info, root_folder)
-                if folder is None:
-                    error_msg = f'无法获取视频目标文件夹: {info["title"]}'
-                    logger.warning(error_msg)
+                    folder = download_single_video(info, root_folder, resolution)
+                    if folder is None:
+                        error_msg = f'下載影片失敗: {info["title"]}'
+                        logger.warning(error_msg)
+                        return False, None, error_msg
+
+                logger.info(f'處理影片: {folder}')
+                begin_session(folder)
+                if force_retranslate:
+                    from tools.target_language import clear_translation_cache
+                    keep_bible = False
+                    summary_path = os.path.join(folder, 'summary.json')
+                    if os.path.isfile(summary_path):
+                        try:
+                            with open(summary_path, 'r', encoding='utf-8') as handle:
+                                keep_bible = bool((json.load(handle) or {}).get('outline_locked'))
+                        except Exception:
+                            keep_bible = False
+                    logger.info(f'強制重翻：{folder} keep_bible={keep_bible}')
+                    clear_translation_cache(folder, keep_bible=keep_bible)
+                elif force_redub:
+                    from tools.target_language import clear_tts_cache
+                    logger.info(f'強制重配：{folder}')
+                    clear_tts_cache(folder)
+
+                # 完成下載階段，進入人聲分離階段
+                current_stage += 1
+                progress_base += stage_weight
+                stage_name, stage_weight = stages[current_stage]
+                check_stop()
+                mark_stage(stage_name, progress_base)
+
+                try:
+                    status, vocals_path, _ = separate_all_audio_under_folder(
+                        folder, model_name=demucs_model, device=device, progress=True, shifts=shifts)
+                    logger.info(f'人聲分離完成: {vocals_path}')
+                except JobStopped:
+                    raise
+                except Exception as e:
+                    stack_trace = traceback.format_exc()
+                    error_msg = f'人聲分離失敗: {str(e)}\n{stack_trace}'
+                    logger.error(error_msg)
+                    raise
+
+                # 完成人聲分離階段，進入語音識別階段
+                current_stage += 1
+                progress_base += stage_weight
+                stage_name, stage_weight = stages[current_stage]
+                check_stop()
+                mark_stage(stage_name, progress_base)
+
+                try:
+                    status, result_json = transcribe_all_audio_under_folder(
+                        folder, asr_method=asr_method, whisper_model_name=whisper_model, device=device,
+                        batch_size=batch_size, diarization=diarization,
+                        min_speakers=whisper_min_speakers,
+                        max_speakers=whisper_max_speakers)
+                    logger.info(f'語音識別完成: {status}')
+                except JobStopped:
+                    raise
+                except Exception as e:
+                    stack_trace = traceback.format_exc()
+                    error_msg = f'語音識別失敗: {str(e)}\n{stack_trace}'
+                    logger.error(error_msg)
                     return False, None, error_msg
 
-                folder = download_single_video(info, root_folder, resolution)
-                if folder is None:
-                    error_msg = f'下载视频失败: {info["title"]}'
-                    logger.warning(error_msg)
+                # 完成語音識別階段，進入翻譯階段
+                current_stage += 1
+                progress_base += stage_weight
+                stage_name, stage_weight = stages[current_stage]
+                check_stop()
+                mark_stage(stage_name, progress_base)
+
+                try:
+                    status, summary, translation = translate_all_transcript_under_folder(
+                        folder, method=translation_method, target_language=translation_target_language)
+                    logger.info(f'翻譯完成: {status}')
+                except JobStopped:
+                    raise
+                except Exception as e:
+                    stack_trace = traceback.format_exc()
+                    error_msg = f'翻譯失敗: {str(e)}\n{stack_trace}'
+                    logger.error(error_msg)
                     return False, None, error_msg
 
-            logger.info(f'处理视频: {folder}')
+                # 完成翻譯階段，進入語音合成階段
+                current_stage += 1
+                progress_base += stage_weight
+                stage_name, stage_weight = stages[current_stage]
+                check_stop()
+                mark_stage(stage_name, progress_base)
 
-            # 完成下载阶段，进入人声分离阶段
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
+                try:
+                    status, synth_path, _ = generate_all_wavs_under_folder(
+                        folder, method=tts_method, target_language=tts_target_language, voice=voice)
+                    logger.info(f'語音合成完成: {synth_path}')
+                except JobStopped:
+                    raise
+                except Exception as e:
+                    stack_trace = traceback.format_exc()
+                    error_msg = f'語音合成失敗: {str(e)}\n{stack_trace}'
+                    logger.error(error_msg)
+                    return False, None, error_msg
 
-            try:
-                status, vocals_path, _ = separate_all_audio_under_folder(
-                    folder, model_name=demucs_model, device=device, progress=True, shifts=shifts)
-                logger.info(f'人声分离完成: {vocals_path}')
+                # 完成語音合成階段，進入影片合成階段
+                current_stage += 1
+                progress_base += stage_weight
+                stage_name, stage_weight = stages[current_stage]
+                check_stop()
+                mark_stage(stage_name, progress_base)
+
+                try:
+                    status, output_video = synthesize_all_video_under_folder(
+                        folder, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=target_resolution,
+                        background_music=background_music, bgm_volume=bgm_volume, video_volume=video_volume)
+                    logger.info(f'影片合成完成: {output_video}')
+                except JobStopped:
+                    raise
+                except Exception as e:
+                    stack_trace = traceback.format_exc()
+                    error_msg = f'影片合成失敗: {str(e)}\n{stack_trace}'
+                    logger.error(error_msg)
+                    return False, None, error_msg
+
+                # 完成所有階段，回報100%進度
+                mark_stage("處理完成!", 100)
+
+                return True, output_video, "處理成功"
+            except JobStopped:
+                raise
             except Exception as e:
                 stack_trace = traceback.format_exc()
-                error_msg = f'人声分离失败: {str(e)}\n{stack_trace}'
+                error_msg = f'處理影片時發生錯誤 {info["title"] if isinstance(info, dict) else info}: {str(e)}\n{stack_trace}'
                 logger.error(error_msg)
-                return False, None, error_msg
+                if retry < max_retries - 1:
+                    logger.info(f'嘗試重試 {retry + 2}/{max_retries}...')
+                else:
+                    return False, None, error_msg
 
-            # 完成人声分离阶段，进入语音识别阶段
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
-
-            try:
-                status, result_json = transcribe_all_audio_under_folder(
-                    folder, asr_method=asr_method, whisper_model_name=whisper_model, device=device,
-                    batch_size=batch_size, diarization=diarization,
-                    min_speakers=whisper_min_speakers,
-                    max_speakers=whisper_max_speakers)
-                logger.info(f'语音识别完成: {status}')
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f'语音识别失败: {str(e)}\n{stack_trace}'
-                logger.error(error_msg)
-                return False, None, error_msg
-
-            # 完成语音识别阶段，进入翻译阶段
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
-
-            try:
-                status, summary, translation = translate_all_transcript_under_folder(
-                    folder, method=translation_method, target_language=translation_target_language)
-                logger.info(f'翻译完成: {status}')
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f'翻译失败: {str(e)}\n{stack_trace}'
-                logger.error(error_msg)
-                return False, None, error_msg
-
-            # 完成翻译阶段，进入语音合成阶段
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
-
-            try:
-                status, synth_path, _ = generate_all_wavs_under_folder(
-                    folder, method=tts_method, target_language=tts_target_language, voice=voice)
-                logger.info(f'语音合成完成: {synth_path}')
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f'语音合成失败: {str(e)}\n{stack_trace}'
-                logger.error(error_msg)
-                return False, None, error_msg
-
-            # 完成语音合成阶段，进入视频合成阶段
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
-
-            try:
-                status, output_video = synthesize_all_video_under_folder(
-                    folder, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=target_resolution,
-                    background_music=background_music, bgm_volume=bgm_volume, video_volume=video_volume)
-                logger.info(f'视频合成完成: {output_video}')
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f'视频合成失败: {str(e)}\n{stack_trace}'
-                logger.error(error_msg)
-                return False, None, error_msg
-
-            # 完成所有阶段，报告100%进度
-            if progress_callback:
-                progress_callback(100, "处理完成!")
-
-            return True, output_video, "处理成功"
-        except Exception as e:
-            stack_trace = traceback.format_exc()
-            error_msg = f'处理视频时发生错误 {info["title"] if isinstance(info, dict) else info}: {str(e)}\n{stack_trace}'
-            logger.error(error_msg)
-            if retry < max_retries - 1:
-                logger.info(f'尝试重试 {retry + 2}/{max_retries}...')
-            else:
-                return False, None, error_msg
-
-    return False, None, f"达到最大重试次数: {max_retries}"
+        return False, None, f"達到最大重試次數: {max_retries}"
+    finally:
+        finish_session()
 
 
-def do_everything(root_folder, url, num_videos=5, resolution='1080p',
-                  demucs_model='htdemucs_ft', device='auto', shifts=5,
-                  asr_method='WhisperX', whisper_model='large', batch_size=32, diarization=False,
+def do_everything(root_folder, url, resolution='1080p',
+                  shifts=1,
+                  target_language='English',
+                  subtitles=True, speed_up=1.00, fps=30, target_resolution='1080p',
+                  max_workers=3, max_retries=5,
+                  background_music=None, bgm_volume=0.5, video_volume=1.0,
+                  progress_callback=None, local_file=None,
+                  demucs_model='Replicate', asr_method='OpenAI',
+                  whisper_model='gpt-4o-transcribe-diarize',
+                  translation_method='OpenAI', tts_method='Fish',
+                  num_videos=1, voice=None, device='auto', batch_size=32,
                   whisper_min_speakers=None, whisper_max_speakers=None,
-                  translation_method='LLM', translation_target_language='简体中文',
-                  tts_method='xtts', tts_target_language='中文', voice='zh-CN-XiaoxiaoNeural',
-                  subtitles=True, speed_up=1.00, fps=30,
-                  background_music=None, bgm_volume=0.5, video_volume=1.0, target_resolution='1080p',
-                  max_workers=3, max_retries=5, progress_callback=None):
+                  diarization=False,
+                  words_per_sec=None, translate_workers=None,
+                  force_retranslate=False, force_redub=False):
     """
-    处理整个视频处理流程，增加了进度回调函数
+    處理整個影片處理流程，增加了進度回呼函式
 
     Args:
-        progress_callback: 回调函数，用于报告进度和状态，格式为 progress_callback(progress_percent, status_message)
+        progress_callback: 回呼函式，用於回報進度和狀態，格式為 progress_callback(progress_percent, status_message)
     """
+    from tools.cost_tracker import clear_last_markdowns, last_cost_markdown
+    from tools.job_control import JobStopped, check_stop
+    from tools.target_language import split_target_language
+    clear_last_markdowns()
+    translation_target_language, tts_target_language = split_target_language(target_language)
+    if words_per_sec not in (None, '', False):
+        try:
+            os.environ['DUBBING_WORDS_PER_SEC'] = str(float(words_per_sec))
+        except (TypeError, ValueError):
+            pass
+    if translate_workers not in (None, '', False):
+        try:
+            os.environ['TRANSLATE_WORKERS'] = str(max(1, int(float(translate_workers))))
+        except (TypeError, ValueError):
+            pass
+
+    def _done(status, video):
+        md = last_cost_markdown()
+        if md and '尚無成本資料' not in md:
+            status = f'{status}\n\n{md}'
+        return status, video
+
     try:
         success_list = []
         fail_list = []
         error_details = []
 
-        # 记录处理开始信息和所有参数
+        # 紀錄處理開始資訊和所有參數
         logger.info("-" * 50)
-        logger.info(f"开始处理任务: {url}")
-        logger.info(f"参数: 输出文件夹={root_folder}, 视频数量={num_videos}, 分辨率={resolution}")
-        logger.info(f"人声分离: 模型={demucs_model}, 设备={device}, 移位次数={shifts}")
-        logger.info(f"语音识别: 方法={asr_method}, 模型={whisper_model}, 批大小={batch_size}")
-        logger.info(f"翻译: 方法={translation_method}, 目标语言={translation_target_language}")
-        logger.info(f"语音合成: 方法={tts_method}, 目标语言={tts_target_language}, 声音={voice}")
-        logger.info(f"视频合成: 字幕={subtitles}, 速度={speed_up}, FPS={fps}, 分辨率={target_resolution}")
+        logger.info(f"開始處理任務: {url}")
+        logger.info(f"參數: 輸出資料夾={root_folder}, 影片數量={num_videos}, 解析度={resolution}")
+        logger.info(f"人聲分離: 模型={demucs_model}, 裝置={device}, 移位次數={shifts}")
+        logger.info(f"語音識別: 方法={asr_method}, 模型={whisper_model}, 批次大小={batch_size}")
+        logger.info(f"翻譯: 方法={translation_method}, 目標語言={translation_target_language}")
+        logger.info(f"語音合成: 方法={tts_method}, 目標語言={tts_target_language}, 聲音={voice}")
+        logger.info(f"影片合成: 字幕={subtitles}, 速度={speed_up}, FPS={fps}, 解析度={target_resolution}")
         logger.info("-" * 50)
 
-        url = url.replace(' ', '').replace('，', '\n').replace(',', '\n')
-        urls = [_ for _ in url.split('\n') if _]
+        jobs = collect_jobs(url, local_file)
+        if not jobs:
+            return _done('請上傳本地影片，或填入網址 / 本機路徑。不必兩者都填。', None)
 
-        # 初始化模型（改用新的初始化函数）
+        def _run_process_video(info):
+            return process_video(
+                info, root_folder, resolution,
+                demucs_model, device, shifts,
+                asr_method, whisper_model, batch_size, diarization, whisper_min_speakers, whisper_max_speakers,
+                translation_method, translation_target_language,
+                tts_method, tts_target_language, voice,
+                subtitles, speed_up, fps, background_music, bgm_volume, video_volume,
+                target_resolution, max_retries, progress_callback,
+                force_retranslate=force_retranslate, force_redub=force_redub,
+            )
+
+        # 初始化模型（改用新的初始化函式）
         try:
             if progress_callback:
                 progress_callback(5, "初始化模型中...")
             initialize_models(tts_method, asr_method, diarization)
         except Exception as e:
             stack_trace = traceback.format_exc()
-            logger.error(f"初始化模型失败: {str(e)}\n{stack_trace}")
-            return f"初始化模型失败: {str(e)}", None
+            logger.error(f"初始化模型失敗: {str(e)}\n{stack_trace}")
+            return _done(f"初始化模型失敗: {str(e)}", None)
 
         out_video = None
-        if url.endswith('.mp4'):
+        local_jobs = [src for kind, src in jobs if kind == 'local']
+        url_jobs = [src for kind, src in jobs if kind == 'url']
+
+        for src in local_jobs:
+            check_stop()
             try:
-                import shutil
-                # 获取原始视频文件名（不带路径）
-                original_file_name = os.path.basename(url)
-
-                # 去除文件扩展名，生成文件夹名称
-                new_folder_name = os.path.splitext(original_file_name)[0]
-
-                # 构建新文件夹的完整路径
-                new_folder_path = os.path.join(root_folder, new_folder_name)
-
-                # 在 root_folder 下创建该文件夹
-                os.makedirs(new_folder_path, exist_ok=True)
-
-                # 构建原始文件的完整路径
-                original_file_path = os.path.join(root_folder, original_file_name)
-
-                # 构建新位置的完整路径
-                new_file_path = os.path.join(new_folder_path, "download.mp4")
-
-                # 将视频文件移动到新创建的文件夹中并重命名
-                shutil.copy(original_file_path, new_file_path)
-                # 在 root_folder 下创建该文件夹
-                os.makedirs(new_folder_path, exist_ok=True)
-
-                success, output_video, error_msg = process_video(
-                    new_file_path, root_folder, resolution,
-                    demucs_model, device, shifts,
-                    asr_method, whisper_model, batch_size, diarization, whisper_min_speakers, whisper_max_speakers,
-                    translation_method, translation_target_language,
-                    tts_method, tts_target_language, voice,
-                    subtitles, speed_up, fps, background_music, bgm_volume, video_volume,
-                    target_resolution, max_retries, progress_callback
-                )
-
+                preferred = None
+                if local_file is not None:
+                    if isinstance(local_file, dict):
+                        preferred = local_file.get('orig_name') or local_file.get('name')
+                    else:
+                        preferred = getattr(local_file, 'orig_name', None)
+                dest = prepare_local_video(src, root_folder, preferred_name=preferred)
+                success, output_video, error_msg = _run_process_video(dest)
                 if success:
-                    logger.info(f"视频处理成功: {new_file_path}")
-                    return '处理成功', output_video
+                    success_list.append(src)
+                    out_video = output_video
+                    logger.info(f"影片處理成功: {dest}")
                 else:
-                    logger.error(f"视频处理失败: {new_file_path}, 错误: {error_msg}")
-                    return f'处理失败: {error_msg}', None
+                    fail_list.append(src)
+                    error_details.append(f"{src}: {error_msg}")
+                    logger.error(f"影片處理失敗: {dest}, 錯誤: {error_msg}")
+            except JobStopped:
+                return _done('已中止', out_video)
             except Exception as e:
                 stack_trace = traceback.format_exc()
-                logger.error(f"处理本地视频失败: {str(e)}\n{stack_trace}")
-                return f"处理本地视频失败: {str(e)}", None
-        else:
+                fail_list.append(src)
+                error_details.append(f"{src}: {str(e)}")
+                logger.error(f"處理本地影片失敗: {str(e)}\n{stack_trace}")
+
+        if url_jobs:
             try:
-                videos_info = []
                 if progress_callback:
-                    progress_callback(10, "获取视频信息中...")
-
-                for video_info in get_info_list_from_url(urls, num_videos):
+                    progress_callback(10, "取得影片資訊中...")
+                videos_info = []
+                for video_info in get_info_list_from_url(url_jobs, num_videos):
                     videos_info.append(video_info)
-
                 if not videos_info:
-                    return "获取视频信息失败，请检查URL是否正确", None
-
+                    if not success_list:
+                        return _done("取得影片資訊失敗，請檢查網址是否正確", out_video)
+                    error_details.append("取得影片資訊失敗，請檢查網址是否正確")
                 for info in videos_info:
+                    check_stop()
                     try:
-                        success, output_video, error_msg = process_video(
-                            info, root_folder, resolution,
-                            demucs_model, device, shifts,
-                            asr_method, whisper_model, batch_size, diarization, whisper_min_speakers,
-                            whisper_max_speakers,
-                            translation_method, translation_target_language,
-                            tts_method, tts_target_language, voice,
-                            subtitles, speed_up, fps, background_music, bgm_volume, video_volume,
-                            target_resolution, max_retries, progress_callback
-                        )
-
+                        success, output_video, error_msg = _run_process_video(info)
+                        label = info['title'] if isinstance(info, dict) else info
                         if success:
                             success_list.append(info)
                             out_video = output_video
-                            logger.info(f"成功处理视频: {info['title'] if isinstance(info, dict) else info}")
+                            logger.info(f"成功處理影片: {label}")
                         else:
                             fail_list.append(info)
-                            error_details.append(f"{info['title'] if isinstance(info, dict) else info}: {error_msg}")
-                            logger.error(
-                                f"处理视频失败: {info['title'] if isinstance(info, dict) else info}, 错误: {error_msg}")
+                            error_details.append(f"{label}: {error_msg}")
+                            logger.error(f"處理影片失敗: {label}, 錯誤: {error_msg}")
+                    except JobStopped:
+                        return _done('已中止', out_video)
                     except Exception as e:
                         stack_trace = traceback.format_exc()
                         fail_list.append(info)
-                        error_details.append(f"{info['title'] if isinstance(info, dict) else info}: {str(e)}")
-                        logger.error(
-                            f"处理视频出错: {info['title'] if isinstance(info, dict) else info}, 错误: {str(e)}\n{stack_trace}")
+                        error_details.append(f"{info}: {str(e)}")
+                        logger.error(f"處理影片出錯: {info}, 錯誤: {str(e)}\n{stack_trace}")
             except Exception as e:
                 stack_trace = traceback.format_exc()
-                logger.error(f"获取视频列表失败: {str(e)}\n{stack_trace}")
-                return f"获取视频列表失败: {str(e)}", None
+                logger.error(f"取得影片清單失敗: {str(e)}\n{stack_trace}")
+                if not success_list:
+                    return _done(f"取得影片清單失敗: {str(e)}", out_video)
+                error_details.append(str(e))
 
-        # 记录处理结果汇总
+        # 紀錄處理結果彙總
         logger.info("-" * 50)
-        logger.info(f"处理完成: 成功={len(success_list)}, 失败={len(fail_list)}")
+        logger.info(f"處理完成: 成功={len(success_list)}, 失敗={len(fail_list)}")
         if error_details:
-            logger.info("失败详情:")
+            logger.info("失敗詳情:")
             for detail in error_details:
                 logger.info(f"  - {detail}")
 
-        return f'成功: {len(success_list)}\n失败: {len(fail_list)}', out_video
+        return _done(f'成功: {len(success_list)}\n失敗: {len(fail_list)}', out_video)
 
+    except JobStopped:
+        return _done('已中止', None)
     except Exception as e:
-        # 捕获整体处理过程中的任何错误
+        # 捕捉整體處理過程中的任何錯誤
         stack_trace = traceback.format_exc()
-        error_msg = f"处理过程中发生错误: {str(e)}\n{stack_trace}"
+        error_msg = f"處理過程中發生錯誤: {str(e)}\n{stack_trace}"
         logger.error(error_msg)
-        return error_msg, None
+        return _done(error_msg, None)
+
+
+def stream_do_everything(root_folder, url, *args, local_file=None, **kwargs):
+    """Yield (status, video, cost_markdown) so the WebUI can stream progress."""
+    from tools.cost_tracker import current_session, last_cost_markdown, live_cost_markdown
+    from tools.job_control import JobStopped, is_stopped, request_stop, start_job
+
+    start_job()
+    q = queue.Queue()
+    holder = {'status': '準備中...', 'video': None}
+
+    def cb(pct, msg):
+        md = live_cost_markdown() if current_session() is not None else ''
+        q.put(('progress', msg, md))
+
+    def worker():
+        try:
+            status, video = do_everything(
+                root_folder, url, *args,
+                progress_callback=cb,
+                local_file=local_file,
+                **kwargs,
+            )
+            holder['status'] = '已中止' if is_stopped() else status
+            holder['video'] = video
+        except JobStopped:
+            holder['status'] = '已中止'
+            holder['video'] = None
+        except Exception as e:
+            holder['status'] = f'處理失敗: {e}\n{traceback.format_exc()}'
+            holder['video'] = None
+        finally:
+            q.put(('done', None, None))
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    try:
+        yield '準備中...\n合成狀態會即時顯示各步驟進度與成本。\n可只上傳本地影片，不必填網址。', None, '尚未開始'
+        while True:
+            try:
+                kind, msg, md = q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if kind == 'done':
+                final = holder['status']
+                if is_stopped() and (not final or final == '準備中...'):
+                    final = '已中止'
+                yield final, holder['video'], last_cost_markdown()
+                break
+            if is_stopped():
+                yield '正在中止…目前這一步結束後就會停。', None, md or ''
+                continue
+            yield msg, None, md
+    except GeneratorExit:
+        request_stop()
+        raise
 
 
 if __name__ == '__main__':
@@ -414,5 +645,5 @@ if __name__ == '__main__':
         root_folder='videos',
         url='https://www.bilibili.com/video/BV1kr421M7vz/',
         translation_method='LLM',
-        # translation_method = 'Google Translate', translation_target_language = '简体中文',
+        # translation_method = 'Google Translate', translation_target_language = '簡體中文',
     )

@@ -1,7 +1,7 @@
 import os
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QSlider, QRadioButton, QLineEdit, QPushButton,
-                               QFileDialog, QGroupBox)
+                               QFileDialog, QGroupBox, QComboBox)
 from PySide6.QtCore import Qt, QUrl
 # 正确导入QVideoWidget
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -111,6 +111,29 @@ class RadioButtonGroup(QWidget):
             if button.isChecked():
                 return option
         return None
+
+
+class ResolutionDropdown(QWidget):
+    """分辨率下拉選單，預設 1080p。"""
+
+    CHOICES = ['4320p', '2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p']
+
+    def __init__(self, label='分辨率', value='1080p', parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(label))
+        self.combo = QComboBox()
+        self.combo.addItems(self.CHOICES)
+        self.setValue(value)
+        layout.addWidget(self.combo)
+        self.setLayout(layout)
+
+    def value(self):
+        return self.combo.currentText()
+
+    def setValue(self, value):
+        text = value if value in self.CHOICES else '1080p'
+        self.combo.setCurrentText(text)
 
 
 class AudioSelector(QWidget):

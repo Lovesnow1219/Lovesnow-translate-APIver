@@ -5,7 +5,19 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrol
 from PySide6.QtCore import Qt, Signal
 
 from ui_components import (CustomSlider, FloatSlider, RadioButtonGroup,
-                           AudioSelector, VideoPlayer)
+                           AudioSelector, VideoPlayer, ResolutionDropdown)
+
+try:
+    from tools.target_language import TARGET_LANGUAGES, translation_language
+except ImportError:
+    TARGET_LANGUAGES = [
+        'English', 'Japanese', '越南文', '簡體中文', '繁體中文', '粵語',
+        'Korean（部分支援）', '西班牙文（部分支援）', 'French（部分支援）',
+        '泰文（部分支援）', '印尼文（部分支援）', '馬來文（部分支援）', '菲律賓文（部分支援）',
+    ]
+
+    def translation_language(label):
+        return label
 
 
 class SettingsTab(QWidget):
@@ -59,16 +71,8 @@ class SettingsTab(QWidget):
         self.video_folder = self.add_label_value("videos", "视频输出到此文件夹")
 
         # 分辨率
-        self.resolution = RadioButtonGroup(
-            ['4320p', '2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'],
-            "分辨率",
-            '1080p'
-        )
+        self.resolution = ResolutionDropdown('分辨率', '1080p')
         self.scroll_layout.addWidget(self.resolution)
-
-        # 下载视频数量
-        self.video_count = CustomSlider(1, 100, 1, "下载视频数量", 5)
-        self.scroll_layout.addWidget(self.video_count)
 
         # 音频处理配置
         self.scroll_layout.addWidget(QLabel("=== 音频处理配置 ==="))
@@ -80,10 +84,6 @@ class SettingsTab(QWidget):
             'htdemucs_ft'
         )
         self.scroll_layout.addWidget(self.model)
-
-        # 计算设备
-        self.device = RadioButtonGroup(['auto', 'cuda', 'cpu'], "计算设备", 'auto')
-        self.scroll_layout.addWidget(self.device)
 
         # 移位次数
         self.shifts = CustomSlider(0, 10, 1, "移位次数 Number of shifts", 5)
@@ -101,21 +101,9 @@ class SettingsTab(QWidget):
         self.whisperx_size = RadioButtonGroup(['large', 'medium', 'small', 'base', 'tiny'], "WhisperX模型大小", 'large')
         self.scroll_layout.addWidget(self.whisperx_size)
 
-        # 批处理大小
-        self.batch_size = CustomSlider(1, 128, 1, "批处理大小 Batch Size", 32)
-        self.scroll_layout.addWidget(self.batch_size)
-
         # 分离多个说话人
         self.separate_speakers = RadioButtonGroup([True, False], "分离多个说话人", True)
         self.scroll_layout.addWidget(self.separate_speakers)
-
-        # 最小说话人数
-        self.min_speakers = RadioButtonGroup([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], "最小说话人数", None)
-        self.scroll_layout.addWidget(self.min_speakers)
-
-        # 最大说话人数
-        self.max_speakers = RadioButtonGroup([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], "最大说话人数", None)
-        self.scroll_layout.addWidget(self.max_speakers)
 
         # 翻译配置
         self.scroll_layout.addWidget(QLabel("=== 翻译配置 ==="))
@@ -131,7 +119,7 @@ class SettingsTab(QWidget):
         self.target_language_translation_label = QLabel("目标语言 (翻译)")
         self.scroll_layout.addWidget(self.target_language_translation_label)
         self.target_language_translation = RadioButtonGroup(
-            ['简体中文', '繁体中文', 'English', 'Cantonese', 'Japanese', 'Korean'], "目标语言 (翻译)", '简体中文')
+            TARGET_LANGUAGES, "目标语言 (翻译)", '簡體中文')
         self.scroll_layout.addWidget(self.target_language_translation)
 
         # TTS配置
@@ -146,7 +134,8 @@ class SettingsTab(QWidget):
         self.target_language_tts_label = QLabel("目标语言 (TTS)")
         self.scroll_layout.addWidget(self.target_language_tts_label)
         self.target_language_tts = RadioButtonGroup(
-            ['中文', 'English', '粤语', 'Japanese', 'Korean', 'Spanish', 'French'], "目标语言 (TTS)", '中文')
+            ['中文', 'English', '粤语', 'Japanese', 'Korean', 'Spanish', 'French',
+             'Vietnamese', 'Thai', 'Indonesian', 'Malay', 'Filipino'], "目标语言 (TTS)", '中文')
         self.scroll_layout.addWidget(self.target_language_tts)
 
         # EdgeTTS声音选择
@@ -184,11 +173,7 @@ class SettingsTab(QWidget):
         self.scroll_layout.addWidget(self.video_volume)
 
         # 分辨率 (输出)
-        self.output_resolution = RadioButtonGroup(
-            ['4320p', '2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'],
-            "输出分辨率",
-            '1080p'
-        )
+        self.output_resolution = ResolutionDropdown('输出分辨率', '1080p')
         self.scroll_layout.addWidget(self.output_resolution)
 
         # 高级配置
@@ -214,16 +199,11 @@ class SettingsTab(QWidget):
         config = {
             "video_folder": self.video_folder.text(),
             "resolution": self.resolution.value(),
-            "video_count": self.video_count.value(),
             "model": self.model.value(),
-            "device": self.device.value(),
             "shifts": self.shifts.value(),
             "asr_model": self.asr_model.value(),
             "whisperx_size": self.whisperx_size.value(),
-            "batch_size": self.batch_size.value(),
             "separate_speakers": self.separate_speakers.value(),
-            "min_speakers": self.min_speakers.value(),
-            "max_speakers": self.max_speakers.value(),
             "translation_method": self.translation_method.value(),
             "target_language_translation": self.target_language_translation.value(),
             "tts_method": self.tts_method.value(),
@@ -250,18 +230,11 @@ class SettingsTab(QWidget):
             # 为每个单选按钮组应用更健壮的选择逻辑
             # 分辨率
             resolution_value = config.get("resolution", "1080p")
-            self._set_radio_button(self.resolution.buttons, resolution_value, "1080p")
-
-            # 视频数量
-            self.video_count.setValue(config.get("video_count", 5))
+            self.resolution.setValue(resolution_value)
 
             # 模型
             model_value = config.get("model", "htdemucs_ft")
             self._set_radio_button(self.model.buttons, model_value, "htdemucs_ft")
-
-            # 设备
-            device_value = config.get("device", "auto")
-            self._set_radio_button(self.device.buttons, device_value, "auto")
 
             # 移位次数
             self.shifts.setValue(config.get("shifts", 5))
@@ -274,28 +247,18 @@ class SettingsTab(QWidget):
             whisperx_size_value = config.get("whisperx_size", "large")
             self._set_radio_button(self.whisperx_size.buttons, whisperx_size_value, "large")
 
-            # 批处理大小
-            self.batch_size.setValue(config.get("batch_size", 32))
-
             # 分离多个说话人
             separate_speakers_value = config.get("separate_speakers", True)
             self._set_radio_button(self.separate_speakers.buttons, separate_speakers_value, True)
-
-            # 最小说话人数
-            min_speakers_value = config.get("min_speakers", None)
-            self._set_radio_button(self.min_speakers.buttons, min_speakers_value, None)
-
-            # 最大说话人数
-            max_speakers_value = config.get("max_speakers", None)
-            self._set_radio_button(self.max_speakers.buttons, max_speakers_value, None)
 
             # 翻译方式
             translation_method_value = config.get("translation_method", "LLM")
             self._set_radio_button(self.translation_method.buttons, translation_method_value, "LLM")
 
             # 目标语言 (翻译)
-            target_lang_trans_value = config.get("target_language_translation", "简体中文")
-            self._set_radio_button(self.target_language_translation.buttons, target_lang_trans_value, "简体中文")
+            target_lang_trans_value = config.get("target_language_translation", "簡體中文")
+            self._set_language_radio(
+                self.target_language_translation.buttons, target_lang_trans_value, "簡體中文")
 
             # TTS方法
             tts_method_value = config.get("tts_method", "EdgeTTS")
@@ -331,7 +294,7 @@ class SettingsTab(QWidget):
 
             # 输出分辨率
             output_resolution_value = config.get("output_resolution", "1080p")
-            self._set_radio_button(self.output_resolution.buttons, output_resolution_value, "1080p")
+            self.output_resolution.setValue(output_resolution_value)
 
             # 最大工作线程数
             self.max_workers.setValue(config.get("max_workers", 1))
@@ -362,6 +325,21 @@ class SettingsTab(QWidget):
                 if option == default_value:
                     button.setChecked(True)
                     return
+
+    def _set_language_radio(self, buttons, value, default_value):
+        """Match translation labels even with （部分支援） or 简/簡 variants."""
+        try:
+            want = translation_language(value)
+            for option, button in buttons:
+                if option == value or translation_language(option) == want:
+                    button.setChecked(True)
+                    return
+            for option, button in buttons:
+                if option == default_value or translation_language(option) == translation_language(default_value):
+                    button.setChecked(True)
+                    return
+        except Exception:
+            self._set_radio_button(buttons, value, default_value)
 
     def save_config(self):
         """保存配置到JSON文件"""
@@ -401,18 +379,13 @@ class SettingsTab(QWidget):
             default_config = {
                 "video_folder": "videos",
                 "resolution": "1080p",
-                "video_count": 5,
                 "model": "htdemucs_ft",
-                "device": "auto",
                 "shifts": 5,
                 "asr_model": "WhisperX",
                 "whisperx_size": "large",
-                "batch_size": 32,
                 "separate_speakers": True,
-                "min_speakers": None,
-                "max_speakers": None,
                 "translation_method": "LLM",
-                "target_language_translation": "简体中文",
+                "target_language_translation": "簡體中文",
                 "tts_method": "EdgeTTS",
                 "target_language_tts": "中文",
                 "edge_tts_voice": "zh-CN-XiaoxiaoNeural",

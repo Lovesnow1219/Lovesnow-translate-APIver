@@ -2,8 +2,8 @@ import os
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QLineEdit,
                                QScrollArea, QCheckBox, QPushButton, QMessageBox)
 
-from ui_components import (FloatSlider, CustomSlider, RadioButtonGroup,
-                           AudioSelector, VideoPlayer)
+from ui_components import (FloatSlider, CustomSlider,
+                           AudioSelector, VideoPlayer, ResolutionDropdown)
 
 # 尝试导入实际的功能模块
 try:
@@ -54,11 +54,7 @@ class SynthesizeVideoTab(QWidget):
         self.scroll_layout.addWidget(self.video_volume)
 
         # 分辨率
-        self.resolution = RadioButtonGroup(
-            ['4320p', '2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'],
-            "分辨率",
-            '1080p'
-        )
+        self.resolution = ResolutionDropdown('分辨率', '1080p')
         self.scroll_layout.addWidget(self.resolution)
 
         # 执行按钮
@@ -94,10 +90,10 @@ class SynthesizeVideoTab(QWidget):
                 self.add_subtitles.isChecked(),
                 self.speed_factor.value(),
                 self.frame_rate.value(),
+                self.resolution.value(),
                 self.background_music.value(),
                 self.bg_music_volume.value(),
                 self.video_volume.value(),
-                self.resolution.value()
             )
             self.status_label.setText(status)
             if video_path and os.path.exists(video_path):

@@ -30,10 +30,6 @@ class DemucsTab(QWidget):
         )
         self.layout.addWidget(self.model)
 
-        # 计算设备
-        self.device = RadioButtonGroup(['auto', 'cuda', 'cpu'], "计算设备", 'auto')
-        self.layout.addWidget(self.device)
-
         # 显示进度条
         self.show_progress = QCheckBox("显示进度条")
         self.show_progress.setChecked(True)
@@ -85,7 +81,6 @@ class DemucsTab(QWidget):
             status, vocals_path, accompaniment_path = separate_all_audio_under_folder(
                 self.video_folder.text(),
                 self.model.value(),
-                self.device.value(),
                 self.show_progress.isChecked(),
                 self.shifts.value()
             )

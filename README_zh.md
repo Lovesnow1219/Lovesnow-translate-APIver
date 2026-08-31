@@ -55,6 +55,12 @@
 <!-- /TOC -->
 </details>
 
+## 关于本仓库
+
+本仓库是 [`Kedreamix/Linly-Dubbing`](https://github.com/Kedreamix/Linly-Dubbing) 的**二次开发**（Apache-2.0）。原项目版权与许可仍然有效，见 `LICENSE` 与 `NOTICE`。
+
+这里主要改成云端 API WebUI：OpenAI 做识别／翻译，Fish 做配音，Replicate 做人声分离，并加强日文／越南文配音规则，以及翻译结束后「只标不改」的 AI 审稿。密钥只写本机 `.env`（已加入 .gitignore）。除非你要回馈某一段补丁，否则不要向原仓库直接提 PR。
+
 ## 介绍
 
 `Linly-Dubbing` 是一个智能视频多语言AI配音和翻译工具，它融合了[`YouDub-webui`](https://github.com/liuzhao1225/YouDub-webui)的灵感，并在此基础上进行了拓展和优化。我们致力于提供更加多样化和高质量的配音选择，通过集成[`Linly-Talker`](https://github.com/Kedreamix/Linly-Talker)的数字人对口型技术，为用户带来更加自然的多语言视频体验。
@@ -201,7 +207,9 @@ pip install -r requirements_module.txt
 
 ### 3. 配置环境变量
 
-在运行程序前，您需要配置必要的环境变量。请在项目根目录下的 `.env` 文件中添加以下内容，首先将 `env.example`填入以下环境变量并 改名为 `.env` ：
+启动 WebUI 后，打开第一个分页 **「API 設定」**，填入金鑰並保存。內容會寫入本機 `.env`（已在 `.gitignore`，開源時不會被提交）。
+
+也可以複製 `env.example` 為 `.env` 再手動編輯：
 
 - `OPENAI_API_KEY`: 您的OpenAI API密钥，格式通常为 `sk-xxx`。
 - `MODEL_NAME`: 使用的模型名称，如 `gpt-4` 或 `gpt-3.5-turbo`。

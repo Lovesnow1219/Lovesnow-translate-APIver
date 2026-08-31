@@ -55,6 +55,12 @@
 <!-- /TOC -->
 </details>
 
+## About this repository
+
+This tree is a **derivative of** [`Kedreamix/Linly-Dubbing`](https://github.com/Kedreamix/Linly-Dubbing) (Apache-2.0). The original copyright and license still apply; see `LICENSE` and `NOTICE`.
+
+What changed here is mainly a cloud-API WebUI path: OpenAI for ASR/translation, Fish Audio for TTS, Replicate for Demucs, stronger Japanese/Vietnamese dubbing rules, and an AI review pass that **only flags** lines. API keys stay in a local `.env` (gitignored). Do not open a PR against the upstream repo unless you intend to contribute a specific patch back.
+
 ## Introduction
 
 `Linly-Dubbing` is an intelligent multi-language AI dubbing and translation tool inspired by [`YouDub-webui`](https://github.com/liuzhao1225/YouDub-webui) and further extended and optimized. We aim to offer diverse and high-quality dubbing options by integrating [`Linly-Talker`](https://github.com/Kedreamix/Linly-Talker)’s digital human lip-sync technology, creating a more natural multi-language video experience.
@@ -202,7 +208,9 @@ pip install -r requirements_module.txt
 
 ### 3. Configure Environment Variables
 
-Before running the program, you need to configure the necessary environment variables. In the root directory of the project, create a `.env` file by renaming `env.example` and filling in the following variables:
+After launching the WebUI, open the **API 設定** tab, paste your keys, and save. They are written to a local `.env` file (gitignored).
+
+You can also copy `env.example` to `.env` and edit it by hand:
 
 - `OPENAI_API_KEY`: Your OpenAI API key, usually formatted as `sk-xxx`.
 - `MODEL_NAME`: The name of the model you are using, such as `gpt-4` or `gpt-3.5-turbo`.

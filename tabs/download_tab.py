@@ -2,7 +2,7 @@ import os
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QLineEdit,
                                QPushButton, QMessageBox)
 
-from ui_components import CustomSlider, RadioButtonGroup, VideoPlayer
+from ui_components import VideoPlayer, ResolutionDropdown
 
 # 尝试导入实际的功能模块
 try:
@@ -29,16 +29,8 @@ class DownloadTab(QWidget):
         self.layout.addWidget(self.video_folder)
 
         # 分辨率
-        self.resolution = RadioButtonGroup(
-            ['4320p', '2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'],
-            "分辨率",
-            '1080p'
-        )
+        self.resolution = ResolutionDropdown('分辨率', '1080p')
         self.layout.addWidget(self.resolution)
-
-        # 下载视频数量
-        self.video_count = CustomSlider(1, 100, 1, "下载视频数量", 5)
-        self.layout.addWidget(self.video_count)
 
         # 执行按钮
         self.run_button = QPushButton("开始下载")
@@ -74,7 +66,6 @@ class DownloadTab(QWidget):
                 self.video_url.text(),
                 self.video_folder.text(),
                 self.resolution.value(),
-                self.video_count.value()
             )
             self.status_label.setText(status)
             if video_path and os.path.exists(video_path):
