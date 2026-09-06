@@ -7,7 +7,7 @@ Cloud-API video dubbing and translation WebUI.
 ## 用法
 
 ```bash
-git clone https://github.com/Lovesnow1219/Linly-Dubbing-API.git Lovesnow-translate
+git clone https://github.com/Lovesnow1219/Lovesnow-translate-APIver.git Lovesnow-translate
 cd Lovesnow-translate
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
