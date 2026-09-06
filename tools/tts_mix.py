@@ -176,18 +176,32 @@ def duck_bed_under_speech(speech, bed, sample_rate=24000, duck_db=8.0, attack_ms
     return (bed * gain).astype(np.float32)
 
 
-def suppress_leak_in_bed(bed, vocals, sample_rate=24000, reduce_db=12.0):
-    """Dip accompaniment when original vocals are loud so leaked speech is quieter."""
+def _speech_envelope(wav, sample_rate, hold_ms, attack_ms, floor, span):
+    from scipy.ndimage import maximum_filter1d, uniform_filter1d
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size == 0:
+        return wav
+    win = max(1, int(0.025 * sample_rate))
+    rms = np.sqrt(np.maximum(uniform_filter1d(np.square(wav), size=win), 0.0))
+    hold = maximum_filter1d(rms, size=max(1, int(sample_rate * hold_ms / 1000.0)))
+    env = uniform_filter1d(hold, size=max(1, int(sample_rate * attack_ms / 1000.0)))
+    return np.clip((env - floor) / max(span, 1e-6), 0.0, 1.0)
+
+
+def suppress_leak_in_bed(bed, vocals, sample_rate=24000, reduce_db=6.0, speech=None):
+    """Gently hide leaked source speech in the bed. Do not pump the opening music."""
     if bed is None or vocals is None or len(bed) == 0 or len(vocals) == 0:
         return bed
     n = min(len(bed), len(vocals))
-    from scipy.ndimage import maximum_filter1d, uniform_filter1d
-    vocal = np.asarray(vocals[:n], dtype=np.float32)
-    win = max(1, int(0.02 * sample_rate))
-    rms = np.sqrt(np.maximum(uniform_filter1d(np.square(vocal), size=win), 0.0))
-    hold = maximum_filter1d(rms, size=max(1, int(sample_rate * 0.08)))
-    env = uniform_filter1d(hold, size=max(1, int(sample_rate * 0.012)))
-    speech_on = np.clip((env - 0.015) / 0.05, 0.0, 1.0)
+    vocal_on = _speech_envelope(vocals[:n], sample_rate, 280, 80, 0.03, 0.08)
+    if speech is not None and len(speech):
+        tts_n = min(n, len(speech))
+        tts_on = np.zeros(n, dtype=np.float32)
+        tts_on[:tts_n] = _speech_envelope(speech[:tts_n], sample_rate, 220, 70, 0.02, 0.07)
+        # Full dip only under our dub. Vocal-only gaps keep most of the BGM.
+        speech_on = vocal_on * (0.25 + 0.75 * tts_on)
+    else:
+        speech_on = vocal_on * 0.25
     min_gain = float(10.0 ** (-abs(reduce_db) / 20.0))
     gain = 1.0 - (1.0 - min_gain) * speech_on
     out = np.asarray(bed, dtype=np.float32).copy()
@@ -205,7 +219,7 @@ def write_combined_mix(folder, speech, bed, target_language='中文'):
             ceiling = float(min(0.99, max(0.89, np.max(np.abs(orig)))))
     vocals = _load_vocals(folder)
     if vocals is not None:
-        bed = suppress_leak_in_bed(bed, vocals)
+        bed = suppress_leak_in_bed(bed, vocals, speech=speech)
     duck_db = duck_db_for_original(folder, bed)
     if duck_db:
         bed = duck_bed_under_speech(speech, bed, duck_db=duck_db)
@@ -228,9 +242,8 @@ def remix_combined_audio(folder, target_language='中文'):
     speech, _ = librosa.load(tts_path, sr=24000, mono=True)
     bed, _ = librosa.load(inst_path, sr=24000, mono=True)
     write_combined_mix(folder, speech, bed, target_language)
-    video_path = os.path.join(folder, 'video.mp4')
-    if os.path.isfile(video_path):
-        os.remove(video_path)
+    from tools.target_language import remove_published_videos
+    remove_published_videos(folder)
     logger.info(f'已重混伴奏: {os.path.join(folder, "audio_combined.wav")}')
     return True
 
@@ -249,8 +262,27 @@ def stamp_orig_times(transcript):
     return transcript
 
 
-def fit_tts_to_gap(wav_path, max_length, sample_rate=24000):
-    """Keep natural TTS length. Compress only if it would overlap the next line. Never pad."""
+def _fade_to_seconds(wav, sample_rate, cap, fade=0.08):
+    """Keep the attack of a laugh/particle; fade the tail so it does not shove the next line."""
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if sample_rate <= 0 or wav.size == 0:
+        return wav
+    n = int(round(max(0.2, cap) * sample_rate))
+    if n >= wav.size:
+        return wav
+    fade_n = min(int(fade * sample_rate), max(1, n // 4))
+    out = np.array(wav[:n], dtype=np.float32, copy=True)
+    if fade_n > 1:
+        out[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float32)
+    return out
+
+
+def fit_tts_to_gap(wav_path, max_length, sample_rate=24000, particle=False):
+    """Keep a full spoken sentence. Particles may fade; dialogue never slices.
+
+    Dialogue overrun delays the next line. A 嘿嘿/呵/哼 card that is much longer
+    than the picture slot is faded so the next spoken line can stay on picture.
+    """
     try:
         wav, sample_rate = librosa.load(wav_path, sr=sample_rate, mono=True)
     except Exception:
@@ -259,15 +291,25 @@ def fit_tts_to_gap(wav_path, max_length, sample_rate=24000):
     current = len(wav) / sample_rate if sample_rate else 0.0
     if current <= 0:
         return np.zeros((int(0.05 * sample_rate),), dtype=np.float32), 0.05
-    if max_length is None or max_length <= 0.05 or current <= max_length + 0.03:
-        return np.asarray(wav, dtype=np.float32), current
-    cap = int(max(1, max_length * sample_rate))
-    wav = np.asarray(wav[:cap], dtype=np.float32)
-    return wav, len(wav) / sample_rate
+    wav = np.asarray(wav, dtype=np.float32)
+    if particle and max_length is not None and max_length > 0.05 and current > max_length + 0.08:
+        cap = max(0.35, min(current, max_length + 0.06))
+        if current > cap + 0.02:
+            wav = _fade_to_seconds(wav, sample_rate, cap)
+            current = len(wav) / sample_rate if sample_rate else cap
+            logger.info(f'語氣詞超槽，淡出到 {current:.2f}s，不改譯、不拖下一句')
+            return wav, current
+    if max_length is not None and max_length > 0.05 and current > max_length + 0.03:
+        logger.info(f'配音比空檔長 {current - max_length:.2f}s，整句播完、下一句順延')
+    return wav, current
 
 
 def assemble_dub_timeline(transcript, wav_paths, sample_rate=24000, vocals=None):
-    from tools.vocal_particles import available_tts_seconds, is_inner_overlapping_particle
+    from tools.vocal_particles import (
+        available_tts_seconds,
+        is_inner_overlapping_particle,
+        is_particle_card,
+    )
 
     stamp_orig_times(transcript)
     starts = [_orig_start(line) for line in transcript]
@@ -290,7 +332,10 @@ def assemble_dub_timeline(transcript, wav_paths, sample_rate=24000, vocals=None)
             pad = int(round((start - last_end) * sample_rate))
             if pad > 0:
                 full = np.concatenate((full, np.zeros((pad,), dtype=np.float32)))
-        wav, length = fit_tts_to_gap(wav_path, max_len, sample_rate)
+        wav, length = fit_tts_to_gap(
+            wav_path, max_len, sample_rate,
+            particle=is_particle_card(line.get('text')),
+        )
         orig_start = float(line.get('orig_start') or start)
         orig_end = float(line.get('orig_end') or (orig_start + length))
         orig_slice = None
@@ -342,9 +387,8 @@ def restitch_tts_timeline(folder, target_language='中文'):
         return False
     instruments_wav, _ = librosa.load(inst_path, sr=24000, mono=True)
     write_combined_mix(folder, full_wav, instruments_wav, target_language)
-    video_path = os.path.join(folder, 'video.mp4')
-    if os.path.isfile(video_path):
-        os.remove(video_path)
+    from tools.target_language import remove_published_videos
+    remove_published_videos(folder)
     logger.info(f'已重排配音時長: {os.path.join(folder, "audio_combined.wav")}')
     return True
 

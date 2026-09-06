@@ -133,14 +133,7 @@ def split_packed_utterances(transcript, min_duration=1.0):
     return packed
 
 
-_ASR_SOURCE_FIXES = (
-    ('需积', '囤积'),
-    ('需積', '囤積'),
-    ('巨罕', '巨款'),
-    ('本书女', '本小姐'),
-    ('粉树女', '本小姐'),
-    ('本树女', '本小姐'),
-)
+_ASR_SOURCE_FIXES = ()
 _SENTENCE_END = ('。', '！', '？', '!', '?')
 _CLAUSE_END = ('，', ',', '、', '：', ':')
 _LEAD_INS = {
@@ -164,11 +157,6 @@ def cleanup_asr_source(text):
     for src, dst in _ASR_SOURCE_FIXES:
         cleaned = cleaned.replace(src, dst)
     cleaned = re.sub(r'(^|[\s,，、])恩(?=[\s,，。！？!?、…]|$)', r'\1嗯', cleaned)
-    compact = re.sub(r'\s+', ' ', cleaned).strip()
-    if re.fullmatch(r'看[，,\s]*买[，,\s]*好[！!。.]?', compact):
-        return '好看，买！'
-    cleaned = re.sub(r'(^|[\s,，])看\s+好看', r'\1好看', cleaned)
-    cleaned = re.sub(r'好看\s+好看', '好看，好看', cleaned)
     return cleaned
 
 
@@ -197,6 +185,9 @@ def _can_merge_utterance(prev, nxt):
     if str(prev.get('speaker') or '') != str(nxt.get('speaker') or ''):
         return False
     if is_asr_junk(prev.get('text')) or is_asr_junk(nxt.get('text')):
+        return False
+    from tools.line_roles import line_role
+    if line_role(prev.get('text')) != line_role(nxt.get('text')):
         return False
     left = (prev.get('text') or '').strip()
     right = (nxt.get('text') or '').strip()

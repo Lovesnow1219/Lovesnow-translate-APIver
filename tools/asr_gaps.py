@@ -17,10 +17,12 @@ from tools.vocal_particles import (
 
 _MIN_HOLE = 0.45
 _MIN_CLUSTER = 0.28
-_MAX_CLUSTER = 3.2
+_MAX_CLUSTER = 12.0
 _MIN_PEAK = 0.32
 _MERGE = 0.75
-_MAX_CLIPS = 12
+_MAX_CLIPS = 20
+_LEADING_MIN = 1.8
+_LEADING_CHUNK = 16.0
 
 
 def _windows(transcript):
@@ -88,7 +90,7 @@ def uncovered_speech_clusters(samples, sample_rate, transcript):
     return clusters[:_MAX_CLIPS]
 
 
-def _transcribe_clip(samples, sample_rate, start, end):
+def _transcribe_clip(samples, sample_rate, start, end, language=None):
     clip = np.asarray(samples[int(start * sample_rate):int(end * sample_rate)], dtype=np.float32)
     if clip.size < int(0.20 * sample_rate):
         return ''
@@ -97,9 +99,9 @@ def _transcribe_clip(samples, sample_rate, start, end):
     try:
         import soundfile as sf
         sf.write(handle.name, clip, sample_rate)
-        from tools.step023_asr_openai import _transcribe_file
+        from tools.asr_openai import _transcribe_file
         model = os.getenv('OPENAI_ASR_GAP_MODEL') or 'gpt-4o-transcribe'
-        segments = _transcribe_file(handle.name, model)
+        segments = _transcribe_file(handle.name, model, language=language)
     except Exception as exc:
         logger.warning(f'空隙辨識失敗 {start:.2f}-{end:.2f}s：{exc}')
         return ''
@@ -112,7 +114,161 @@ def _transcribe_clip(samples, sample_rate, start, end):
     return ''.join(parts).strip()
 
 
-def recover_missing_speech(folder, transcript):
+def _load_mono(path):
+    import librosa
+    return librosa.load(path, sr=16000, mono=True)
+
+
+def _han_n(text):
+    return sum(1 for ch in (text or '') if '\u4e00' <= ch <= '\u9fff')
+
+
+def _is_substantial(line):
+    text = (line.get('text') if isinstance(line, dict) else line) or ''
+    if is_particle_card(text):
+        return False
+    return _han_n(text) >= 8
+
+
+def _first_substantial_start(transcript, duration):
+    for line in sorted(transcript or [], key=card_start):
+        if _is_substantial(line):
+            return card_start(line)
+    return duration
+
+
+def _leading_chunks(transcript, duration):
+    """0 → first real line. A 3-character stub at 0s does not count as coverage."""
+    if duration < _LEADING_MIN:
+        return []
+    first = _first_substantial_start(transcript, duration)
+    if first < _LEADING_MIN:
+        return []
+    chunks = []
+    cursor = 0.0
+    while cursor < first - 0.35:
+        nxt = min(first, cursor + _LEADING_CHUNK)
+        chunks.append((cursor, nxt))
+        cursor = nxt
+    return chunks
+
+
+def _rms(samples, sample_rate, start, end):
+    i0 = int(max(0, start) * sample_rate)
+    i1 = int(min(len(samples), end * sample_rate))
+    if i1 - i0 < int(0.20 * sample_rate):
+        return 0.0
+    clip = np.asarray(samples[i0:i1], dtype=np.float32)
+    return float(np.sqrt(np.mean(np.square(clip))))
+
+
+def _mix_tracks(folder):
+    tracks = []
+    for name in ('audio.wav', 'audio_instruments.wav'):
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            tracks.append(_load_mono(path))
+        except Exception as exc:
+            logger.warning(f'開頭旁白備援音軌讀不到 {name}：{exc}')
+    return tracks
+
+
+def _spoken_zh(raw):
+    from tools.asr_source import cleanup_asr_source
+    from tools.target_language import is_asr_junk
+
+    text = cleanup_asr_source(raw)
+    compact = ''.join(ch for ch in (text or '') if not ch.isspace())
+    if not compact or is_asr_junk(text) or is_particle_card(text):
+        return ''
+    if not any('\u4e00' <= ch <= '\u9fff' for ch in compact):
+        return ''
+    return text
+
+
+def _transcribe_leading(samples, sample_rate, start, end, language, extras):
+    sources = [(samples, sample_rate)]
+    sources.extend(extras)
+    for wav, rate in sources:
+        if _rms(wav, rate, start, end) < 0.008:
+            continue
+        text = _spoken_zh(_transcribe_clip(wav, rate, start, end, language=language))
+        if text:
+            return text
+    return ''
+
+
+def _apply_leading(folder, lines, samples, sample_rate, language):
+    from tools.line_roles import SPEAKER_NARR
+
+    duration = len(samples) / float(sample_rate)
+    chunks = _leading_chunks(lines, duration)
+    if not chunks:
+        return lines, []
+    until = chunks[-1][1]
+    extras = _mix_tracks(folder)
+    recovered = []
+    for start, end in chunks:
+        text = _transcribe_leading(samples, sample_rate, start, end, language, extras)
+        if not text:
+            continue
+        recovered.append({
+            'start': round(start, 3),
+            'end': round(max(end, start + 0.28), 3),
+            'orig_start': round(start, 3),
+            'orig_end': round(end, 3),
+            'text': text,
+            'speaker': SPEAKER_NARR,
+        })
+    if not recovered:
+        return lines, []
+    old_han = sum(
+        _han_n(item.get('text'))
+        for item in lines
+        if card_start(item) < until
+    )
+    new_han = sum(_han_n(item.get('text')) for item in recovered)
+    if new_han <= old_han + 2:
+        return lines, []
+    kept = [
+        item for item in lines
+        if card_start(item) >= until - 0.02 or _is_substantial(item)
+    ]
+    logger.info(
+        '開頭短卡重聽：{} → {}'.format(
+            old_han,
+            '、'.join(item['text'][:16] for item in recovered),
+        )
+    )
+    return kept, recovered
+
+
+def recover_leading_speech(folder, transcript, language=None):
+    """Re-transcribe an opening that only got a short stub (speech in the music bed)."""
+    if not transcript:
+        return list(transcript or [])
+    wav_path = os.path.join(folder, 'audio_vocals.wav')
+    if not os.path.isfile(wav_path):
+        return [dict(item) for item in transcript]
+    try:
+        samples, sample_rate = _load_mono(wav_path)
+    except Exception as exc:
+        logger.warning(f'無法重聽開頭：{exc}')
+        return [dict(item) for item in transcript]
+    from tools.target_language import load_dub_meta
+
+    lang = language or (load_dub_meta(folder) or {}).get('asr_language')
+    lines = [dict(item) for item in transcript]
+    lines, added = _apply_leading(folder, lines, samples, sample_rate, lang)
+    if added:
+        lines.extend(added)
+        lines.sort(key=card_start)
+    return lines
+
+
+def recover_missing_speech(folder, transcript, language=None):
     """Insert cards for spoken holes the first ASR pass dropped."""
     if not transcript:
         return list(transcript or [])
@@ -120,21 +276,21 @@ def recover_missing_speech(folder, transcript):
     if not os.path.isfile(wav_path):
         return [dict(item) for item in transcript]
     try:
-        import librosa
-        samples, sample_rate = librosa.load(wav_path, sr=16000, mono=True)
+        samples, sample_rate = _load_mono(wav_path)
     except Exception as exc:
         logger.warning(f'無法掃描漏句空隙：{exc}')
         return [dict(item) for item in transcript]
 
     from tools.asr_source import cleanup_asr_source
-    from tools.target_language import is_asr_junk
+    from tools.target_language import is_asr_junk, load_dub_meta
 
+    lang = language or (load_dub_meta(folder) or {}).get('asr_language')
     lines = [dict(item) for item in transcript]
-    added = []
-    for start, end, _peak in uncovered_speech_clusters(samples, sample_rate, lines):
+    lines, added = _apply_leading(folder, lines, samples, sample_rate, lang)
+    for start, end, _peak in uncovered_speech_clusters(samples, sample_rate, lines + added):
         if any(abs(card_start(item) - start) < 0.12 for item in lines + added):
             continue
-        raw = _transcribe_clip(samples, sample_rate, start, end)
+        raw = _transcribe_clip(samples, sample_rate, start, end, language=lang)
         low = ''.join(ch for ch in (raw or '') if ch.strip() and ch not in '，,。．.!！？?、…').lower()
         if low in {'hehe', 'heehee', 'hehheh'}:
             raw = '嘿嘿'

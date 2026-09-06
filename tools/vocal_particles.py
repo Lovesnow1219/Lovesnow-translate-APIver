@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Recover short 呵 / 嗯 / 哼 vocalizations that ASR often drops."""
 import os
+import re
 
 import numpy as np
 from loguru import logger
@@ -100,25 +101,74 @@ def _host_starts_with_particle(text):
     return body.startswith(('嗯', '恩', '呵', '哼', '嘿', '哈哈', '嘻嘻'))
 
 
-def particle_lead_in(text, target_language='English'):
-    """Comma lead for a host line that already starts with 嗯/呵/哼. Empty for particle-only."""
+_LEAD_ALIASES = {
+    '嗯': {
+        'latin': ('Hmm', 'Mm', 'Mhm', 'Hum'),
+        'vi': ('Ừ',),
+        'ja': ('ん',),
+        'ko': ('음',),
+        'es': ('Mm',),
+        'fr': ('Hum',),
+    },
+}
+
+
+def _source_lead_glyph(text):
     body = (text or '').lstrip()
     if not body or _is_particle_text(body):
         return ''
-    glyph = ''
     for mark in ('嘿嘿', '哈哈', '嘻嘻', '嗯', '恩', '呵', '哼', '嘿'):
         if body.startswith(mark):
             rest = body[len(mark):].lstrip('，, ')
-            if rest:
-                if mark in {'嗯', '恩'}:
-                    glyph = '嗯'
-                elif mark == '哼':
-                    glyph = '哼'
-                elif mark in _LAUGH_MARKS:
-                    glyph = '嘿嘿' if mark in {'嘿', '嘿嘿'} else mark
-                else:
-                    glyph = '呵'
-            break
+            if not rest:
+                return ''
+            if mark in {'嗯', '恩'}:
+                return '嗯'
+            if mark == '哼':
+                return '哼'
+            if mark in _LAUGH_MARKS:
+                return '嘿嘿' if mark in {'嘿', '嘿嘿'} else mark
+            return '呵'
+    return ''
+
+
+def particle_lead_stems(glyph, target_language='English'):
+    mapped = particle_translation(glyph, target_language)
+    stem = (mapped or '').rstrip('。. ')
+    kind = _particle_kind(target_language)
+    aliases = _LEAD_ALIASES.get(glyph, {}).get(kind, ())
+    out = []
+    for item in (stem,) + tuple(aliases):
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def translation_has_particle_lead(trans, glyph, target_language='English'):
+    body = (trans or '').lstrip()
+    if not body or not glyph:
+        return False
+    low = body.lower()
+    return any(low.startswith(stem.lower()) for stem in particle_lead_stems(glyph, target_language))
+
+
+def collapse_double_particle_lead(trans, target_language='English'):
+    text = trans or ''
+    kind = _particle_kind(target_language)
+    if kind in {'latin', 'es', 'fr'}:
+        return re.sub(
+            r'^(Hmm|Mm|Mhm|Hum)\s*,\s*(Hmm|Mm|Mhm|Hum)\b',
+            r'\2',
+            text,
+            count=1,
+            flags=re.I,
+        )
+    return text
+
+
+def particle_lead_in(text, target_language='English'):
+    """Comma lead for a host line that already starts with 嗯/呵/哼. Empty for particle-only."""
+    glyph = _source_lead_glyph(text)
     if not glyph:
         return ''
     mapped = particle_translation(glyph, target_language)
@@ -132,14 +182,17 @@ def particle_lead_in(text, target_language='English'):
 
 
 def ensure_particle_translation_lead(line, target_language='English'):
+    trans = collapse_double_particle_lead((line.get('translation') or '').lstrip(), target_language)
+    glyph = _source_lead_glyph(line.get('text'))
     lead = particle_lead_in(line.get('text'), target_language)
-    trans = (line.get('translation') or '').lstrip()
+    if trans and glyph and translation_has_particle_lead(trans, glyph, target_language):
+        line['translation'] = trans
+        return line
     if not lead or not trans:
+        if trans:
+            line['translation'] = trans
         return line
-    stem = lead.rstrip('，, ')
-    if trans.lower().startswith(stem.lower()):
-        return line
-    line['translation'] = lead + trans
+    line['translation'] = collapse_double_particle_lead(lead + trans, target_language)
     return line
 
 
@@ -573,6 +626,14 @@ def _smoke():
     prepend_particle_to_host(heng_host, '哼', 'English')
     assert heng_host['text'].startswith('哼，'), heng_host['text']
     assert heng_host['translation'].startswith('Hmph,'), heng_host['translation']
+    clerk = {
+        'text': '嗯，先生，这款手机还有碎裂风险',
+        'translation': 'Mm, sir, this phone can still crack.',
+    }
+    ensure_particle_translation_lead(clerk, 'English')
+    assert clerk['translation'].startswith('Mm,'), clerk['translation']
+    assert not clerk['translation'].lower().startswith('hmm, mm'), clerk['translation']
+    assert collapse_double_particle_lead('Hmm, Mm, sir, hello.', 'English') == 'Mm, sir, hello.'
     print('vocal_particles overlap repair: ok')
 
 

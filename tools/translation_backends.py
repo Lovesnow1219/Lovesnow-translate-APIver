@@ -1,28 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Dispatch a translation request to the configured backend."""
+"""Dispatch a translation request to OpenAI, with machine-translate fallback."""
 from loguru import logger
 
-from tools.step031_translation_openai import openai_response
-from tools.step032_translation_llm import llm_response
-from tools.step033_translation_translator import translator_response
-from tools.step034_translation_ernie import ernie_response
-from tools.step035_translation_qwen import qwen_response
-from tools.step036_translation_ollama import ollama_response
+from tools.translation_openai import openai_response
+from tools.translation_machine import translator_response
 from tools.target_language import translation_language
 
 
-def llm_translate(method, messages):
-    if method == 'LLM':
-        return llm_response(messages)
-    if method == 'OpenAI':
-        return openai_response(messages)
-    if method == 'Ernie':
-        return ernie_response(messages[1:], system=messages[0]['content'])
-    if method == '阿里云-通义千问':
-        return qwen_response(messages)
-    if method == 'Ollama':
-        return ollama_response(messages)
-    raise Exception('Invalid method')
+def llm_translate(method, messages, reasoning_effort=None, timeout=None, model=None, purpose='translate'):
+    if method in (None, '', 'OpenAI', 'LLM', 'Ernie', '阿里云-通义千问', 'Ollama'):
+        return openai_response(
+            messages, reasoning_effort=reasoning_effort, timeout=timeout, model=model,
+            purpose=purpose,
+        )
+    raise Exception(f'Invalid method: {method}')
 
 
 def emergency_translate(text, target_language, method, fixed_message):

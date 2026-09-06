@@ -123,93 +123,21 @@ def prepare_local_video(src, root_folder, preferred_name=None):
     return dest
 
 
-from .step000_video_downloader import (
+from .download import (
     download_single_video,
     get_info_list_from_url,
     get_target_folder,
     normalize_media_url,
 )
-from .step010_demucs_vr import separate_all_audio_under_folder, init_demucs, release_model
-from .step020_asr import transcribe_all_audio_under_folder
-from .step030_translation import translate_all_transcript_under_folder
-from .step040_tts import generate_all_wavs_under_folder
-from .step050_synthesize_video import synthesize_all_video_under_folder
-from concurrent.futures import ThreadPoolExecutor
-
-# 追蹤模型初始化狀態
-models_initialized = {
-    'demucs': False,
-    'xtts': False,
-    'cosyvoice': False,
-    'whisperx': False,
-    'diarize': False,
-    'funasr': False
-}
+from .demucs import separate_all_audio_under_folder
+from .asr import transcribe_all_audio_under_folder
+from .translation import translate_all_transcript_under_folder
+from .tts import generate_all_wavs_under_folder
+from .synthesize import synthesize_all_video_under_folder
 
 
 def initialize_models(tts_method, asr_method, diarization):
-    """
-    初始化所需的模型。
-    只在第一次呼叫時初始化模型，避免重複載入。
-    """
-    # 使用全域狀態追蹤已初始化的模型
-    global models_initialized
-
-    with ThreadPoolExecutor() as executor:
-        try:
-            from .step011_replicate_demucs import use_replicate
-            # Demucs：有 Replicate token 時走雲端 API，不載入本機模型
-            if use_replicate('Replicate'):
-                logger.info("人聲分離使用 Replicate API，跳過本機 Demucs")
-            elif not models_initialized['demucs']:
-                executor.submit(init_demucs)
-                models_initialized['demucs'] = True
-                logger.info("Demucs模型初始化完成")
-            else:
-                logger.info("Demucs模型已初始化，跳過")
-
-            # TTS模型初始化（API 模式不需本機模型）
-            if tts_method == 'xtts' and not models_initialized['xtts']:
-                from .step042_tts_xtts import init_TTS
-                executor.submit(init_TTS)
-                models_initialized['xtts'] = True
-                logger.info("XTTS模型初始化完成")
-            elif tts_method == 'cosyvoice' and not models_initialized['cosyvoice']:
-                from .step043_tts_cosyvoice import init_cosyvoice
-                executor.submit(init_cosyvoice)
-                models_initialized['cosyvoice'] = True
-                logger.info("CosyVoice模型初始化完成")
-            elif tts_method in ('EdgeTTS', 'OpenAI', 'Fish'):
-                logger.info(f"TTS 使用 API: {tts_method}，跳過本機模型")
-
-            # ASR模型初始化
-            if asr_method == 'OpenAI':
-                logger.info("ASR 使用 OpenAI 雲端辨識 API，跳過本機模型")
-            elif asr_method in ('通義千問', '通义千问', 'Qwen', '阿里雲-通義千問', '阿里云-通义千问'):
-                logger.info("ASR 使用通義千問雲端辨識 API，跳過本機模型")
-            elif asr_method == 'WhisperX':
-                from .step021_asr_whisperx import init_whisperx, init_diarize
-                if not models_initialized['whisperx']:
-                    executor.submit(init_whisperx)
-                    models_initialized['whisperx'] = True
-                    logger.info("WhisperX模型初始化完成")
-                if diarization and not models_initialized['diarize']:
-                    executor.submit(init_diarize)
-                    models_initialized['diarize'] = True
-                    logger.info("Diarize模型初始化完成")
-            elif asr_method == 'FunASR' and not models_initialized['funasr']:
-                from .step022_asr_funasr import init_funasr
-                executor.submit(init_funasr)
-                models_initialized['funasr'] = True
-                logger.info("FunASR模型初始化完成")
-
-        except Exception as e:
-            stack_trace = traceback.format_exc()
-            logger.error(f"初始化模型失敗: {str(e)}\n{stack_trace}")
-            # 出現錯誤時，重設初始化狀態
-            models_initialized = {key: False for key in models_initialized}
-            release_model()  # 釋放已載入的模型
-            raise
+    logger.info(f'雲端流程：人聲分離 Replicate、識別 {asr_method}、配音 {tts_method}')
 
 
 def process_video(info, root_folder, resolution,
@@ -219,7 +147,8 @@ def process_video(info, root_folder, resolution,
                   tts_method, tts_target_language, voice,
                   subtitles, speed_up, fps, background_music, bgm_volume, video_volume,
                   target_resolution, max_retries, progress_callback=None,
-                  force_retranslate=False, force_redub=False):
+                  force_retranslate=False, force_redub=False,
+                  source_language='中文'):
     """
     處理單個影片的完整流程，增加了進度回呼函式
 
@@ -232,7 +161,7 @@ def process_video(info, root_folder, resolution,
     stages = [
         ("下載影片...", 10),  # 10%
         ("人聲分離...", 15),  # 15%
-        ("AI智慧語音識別...", 20),  # 20%
+        ("語音識別與修稿...", 20),  # 20%
         ("字幕翻譯...", 25),  # 25%
         ("AI語音合成...", 20),  # 20%
         ("影片合成...", 10)  # 10%
@@ -284,8 +213,8 @@ def process_video(info, root_folder, resolution,
                                 keep_bible = bool((json.load(handle) or {}).get('outline_locked'))
                         except Exception:
                             keep_bible = False
-                    logger.info(f'強制重翻：{folder} keep_bible={keep_bible}')
-                    clear_translation_cache(folder, keep_bible=keep_bible)
+                    logger.info(f'強制重翻：{folder} keep_bible={keep_bible} language={translation_target_language}')
+                    clear_translation_cache(folder, keep_bible=keep_bible, language=translation_target_language)
                 elif force_redub:
                     from tools.target_language import clear_tts_cache
                     logger.info(f'強制重配：{folder}')
@@ -322,7 +251,8 @@ def process_video(info, root_folder, resolution,
                         folder, asr_method=asr_method, whisper_model_name=whisper_model, device=device,
                         batch_size=batch_size, diarization=diarization,
                         min_speakers=whisper_min_speakers,
-                        max_speakers=whisper_max_speakers)
+                        max_speakers=whisper_max_speakers,
+                        language=source_language)
                     logger.info(f'語音識別完成: {status}')
                 except JobStopped:
                     raise
@@ -424,16 +354,26 @@ def do_everything(root_folder, url, resolution='1080p',
                   whisper_min_speakers=None, whisper_max_speakers=None,
                   diarization=False,
                   words_per_sec=None, translate_workers=None,
-                  force_retranslate=False, force_redub=False):
+                  force_retranslate=False, force_redub=False,
+                  translation_model=None, translation_effort=None,
+                  review_model=None, review_effort=None,
+                  source_language='中文'):
     """
     處理整個影片處理流程，增加了進度回呼函式
 
     Args:
         progress_callback: 回呼函式，用於回報進度和狀態，格式為 progress_callback(progress_percent, status_message)
     """
+    from tools.api_settings import apply_model_choices
     from tools.cost_tracker import clear_last_markdowns, last_cost_markdown
     from tools.job_control import JobStopped, check_stop
     from tools.target_language import split_target_language
+    apply_model_choices(
+        translation_model=translation_model,
+        translation_effort=translation_effort,
+        review_model=review_model,
+        review_effort=review_effort,
+    )
     clear_last_markdowns()
     translation_target_language, tts_target_language = split_target_language(target_language)
     if words_per_sec not in (None, '', False):
@@ -443,7 +383,7 @@ def do_everything(root_folder, url, resolution='1080p',
             pass
     if translate_workers not in (None, '', False):
         try:
-            os.environ['TRANSLATE_WORKERS'] = str(max(1, int(float(translate_workers))))
+            os.environ['TRANSLATE_WORKERS'] = str(max(0, int(float(translate_workers))))
         except (TypeError, ValueError):
             pass
 
@@ -463,8 +403,16 @@ def do_everything(root_folder, url, resolution='1080p',
         logger.info(f"開始處理任務: {url}")
         logger.info(f"參數: 輸出資料夾={root_folder}, 影片數量={num_videos}, 解析度={resolution}")
         logger.info(f"人聲分離: 模型={demucs_model}, 裝置={device}, 移位次數={shifts}")
-        logger.info(f"語音識別: 方法={asr_method}, 模型={whisper_model}, 批次大小={batch_size}")
-        logger.info(f"翻譯: 方法={translation_method}, 目標語言={translation_target_language}")
+        logger.info(f"語音識別: 方法={asr_method}, 模型={whisper_model}, 原片語言={source_language}")
+        logger.info(
+            f"翻譯: 方法={translation_method}, 目標語言={translation_target_language}, "
+            f"模型={translation_model or os.getenv('MODEL_NAME')}, "
+            f"推理={translation_effort or os.getenv('OPENAI_REASONING_EFFORT')}"
+        )
+        logger.info(
+            f"審稿: 模型={review_model or os.getenv('REVIEW_MODEL_NAME')}, "
+            f"推理={review_effort or os.getenv('REVIEW_REASONING_EFFORT')}"
+        )
         logger.info(f"語音合成: 方法={tts_method}, 目標語言={tts_target_language}, 聲音={voice}")
         logger.info(f"影片合成: 字幕={subtitles}, 速度={speed_up}, FPS={fps}, 解析度={target_resolution}")
         logger.info("-" * 50)
@@ -483,6 +431,7 @@ def do_everything(root_folder, url, resolution='1080p',
                 subtitles, speed_up, fps, background_music, bgm_volume, video_volume,
                 target_resolution, max_retries, progress_callback,
                 force_retranslate=force_retranslate, force_redub=force_redub,
+                source_language=source_language,
             )
 
         # 初始化模型（改用新的初始化函式）
@@ -587,9 +536,9 @@ def do_everything(root_folder, url, resolution='1080p',
 def stream_do_everything(root_folder, url, *args, local_file=None, **kwargs):
     """Yield (status, video, cost_markdown) so the WebUI can stream progress."""
     from tools.cost_tracker import current_session, last_cost_markdown, live_cost_markdown
-    from tools.job_control import JobStopped, is_stopped, request_stop, start_job
+    from tools.job_control import JobStopped, bind_job, finish_job, is_stopped, request_stop, start_job
 
-    start_job()
+    job = start_job()
     q = queue.Queue()
     holder = {'status': '準備中...', 'video': None}
 
@@ -598,6 +547,7 @@ def stream_do_everything(root_folder, url, *args, local_file=None, **kwargs):
         q.put(('progress', msg, md))
 
     def worker():
+        bind_job(job)
         try:
             status, video = do_everything(
                 root_folder, url, *args,
@@ -614,6 +564,7 @@ def stream_do_everything(root_folder, url, *args, local_file=None, **kwargs):
             holder['status'] = f'處理失敗: {e}\n{traceback.format_exc()}'
             holder['video'] = None
         finally:
+            finish_job(job)
             q.put(('done', None, None))
 
     worker_thread = threading.Thread(target=worker, daemon=True)
@@ -632,7 +583,7 @@ def stream_do_everything(root_folder, url, *args, local_file=None, **kwargs):
                 yield final, holder['video'], last_cost_markdown()
                 break
             if is_stopped():
-                yield '正在中止…目前這一步結束後就會停。', None, md or ''
+                yield '正在中止…正在收尾目前這次 API 呼叫，之後不會再進下一步。', None, md or ''
                 continue
             yield msg, None, md
     except GeneratorExit:

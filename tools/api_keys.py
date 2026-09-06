@@ -33,11 +33,34 @@ def split_api_keys(raw):
     return keys
 
 
-def collect_api_keys(*env_names):
+def openai_review_key_names():
+    """Review always uses the main OpenAI key so Sol hits that account's free quota."""
+    return ('OPENAI_API_KEY',)
+
+
+def openai_translate_key_names():
+    """Translate-only extra keys. Do not name them OPENAI_API_KEY_2 (ASR would pick that up)."""
+    try:
+        from tools.api_settings import migrate_legacy_env_names
+        migrate_legacy_env_names()
+    except Exception:
+        pass
+    names = []
+    if (os.getenv('OPENAI_TRANSLATE_API_KEY') or '').strip():
+        names.append('OPENAI_TRANSLATE_API_KEY')
+    elif (os.getenv('OPENAI_LUNA_API_KEY') or '').strip():
+        names.append('OPENAI_LUNA_API_KEY')
+    if (os.getenv('OPENAI_TRANSLATE_API_KEY_2') or '').strip():
+        names.append('OPENAI_TRANSLATE_API_KEY_2')
+    names.append('OPENAI_API_KEY')
+    return tuple(names)
+
+
+def collect_api_keys(*env_names, expand=True):
     names = []
     for name in env_names:
         names.append(name)
-        if not name.endswith(('_2', '_3')):
+        if expand and not name.endswith(('_2', '_3')):
             names.extend((f'{name}_2', f'{name}_3'))
     keys = []
     seen = set()
@@ -50,8 +73,8 @@ def collect_api_keys(*env_names):
     return keys
 
 
-def require_api_keys(*env_names, error=''):
-    keys = collect_api_keys(*env_names)
+def require_api_keys(*env_names, error='', expand=True):
+    keys = collect_api_keys(*env_names, expand=expand)
     if not keys:
         raise ValueError(error or f'請先在 .env 設定 {env_names[0]}')
     return keys
@@ -104,15 +127,15 @@ def mark_api_key_dead(key, reason='quota'):
     logger.warning(f'API key {_key_tag(key)} 已停用（{reason}），之後改用其他 key')
 
 
-def live_api_keys(*env_names):
-    keys = collect_api_keys(*env_names)
+def live_api_keys(*env_names, expand=True):
+    keys = collect_api_keys(*env_names, expand=expand)
     with _LOCK:
         live = [key for key in keys if key not in _DEAD]
     return live
 
 
-def next_api_key(*env_names, error=''):
-    keys = require_api_keys(*env_names, error=error)
+def next_api_key(*env_names, error='', expand=True):
+    keys = require_api_keys(*env_names, error=error, expand=expand)
     with _LOCK:
         live = [key for key in keys if key not in _DEAD]
         pool = live or keys
@@ -123,9 +146,30 @@ def next_api_key(*env_names, error=''):
     return pool[position], len(pool), position + 1
 
 
-def workers_for_keys(env_name, *key_envs, default_per_key=4, absolute_max=16):
-    live = live_api_keys(*key_envs)
-    n_keys = max(1, len(live or collect_api_keys(*key_envs)))
+def translate_workers_for_keys():
+    """1 key → 4, each extra translate key +3, cap 10 (4+3+3)."""
+    names = openai_translate_key_names()
+    live = live_api_keys(*names, expand=False)
+    n_keys = max(1, len(live or collect_api_keys(*names, expand=False)))
+    auto = min(10, 4 + 3 * max(0, n_keys - 1))
+    raw = (os.getenv('TRANSLATE_WORKERS') or '').strip()
+    if raw:
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            value = auto
+        if value <= 0:
+            value = auto
+        else:
+            value = min(16, value)
+    else:
+        value = auto
+    return max(1, value), n_keys
+
+
+def workers_for_keys(env_name, *key_envs, default_per_key=4, absolute_max=16, expand=True):
+    live = live_api_keys(*key_envs, expand=expand)
+    n_keys = max(1, len(live or collect_api_keys(*key_envs, expand=expand)))
     maximum = min(int(absolute_max), max(8, default_per_key * n_keys))
     raw = (os.getenv(env_name) or '').strip()
     if raw:

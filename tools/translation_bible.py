@@ -9,7 +9,7 @@ import traceback
 
 from loguru import logger
 
-from tools.step033_translation_translator import translator_response
+from tools.translation_machine import translator_response
 from tools.target_language import needs_translation_refresh, translation_language
 from tools.translation_backends import llm_translate
 from tools.translation_quality import HAN_RE
@@ -51,7 +51,7 @@ def as_bible_text(value):
 
 _GENERIC_GLOSSARY_ZH = {
     '篝火', '火堆', '火', '金币', '金幣', '钱', '錢', '林场', '林場',
-    '森林', '木头', '木頭', '木材', '营地', '營地', '领营', '領營',
+    '森林', '木头', '木頭', '木材', '营地', '營地',
     '血量', '生命', '经验', '經驗', '背包', '药水', '藥水', '金币',
 }
 _GENERIC_GLOSSARY_EN = {
@@ -103,6 +103,42 @@ def bible_context(summary):
     voices = as_bible_text(summary.get('voices'))
     if voices:
         parts.append(f'Voices / narration / inner monologue: {voices}')
+    return '\n'.join(parts)
+
+
+def load_source_bible(folder):
+    path = os.path.join(folder or '', 'source_bible.json')
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def review_bible_context(folder, summary=None):
+    """English outline plus the locked Chinese source outline.
+
+    Review used to see only summary.json. A retranslate can rewrite that file
+    thinner and drop beats. source_bible.json keeps the plot.
+    """
+    parts = []
+    source = load_source_bible(folder)
+    source_text = bible_context(source)
+    if source_text:
+        parts.append('Source plot (Chinese, locked; this is the episode of record):')
+        parts.append(source_text)
+    target_text = bible_context(summary)
+    if target_text:
+        parts.append('Target-language outline (names and spellings; may omit beats):')
+        parts.append(target_text)
+    if source_text:
+        parts.append(
+            'If the Chinese source outline or a Chinese line states a plot beat, keep it. '
+            'Do not "correct" it to match a shorter English outline.'
+        )
     return '\n'.join(parts)
 
 
@@ -183,18 +219,30 @@ def _glossary_example(lang):
     if lang == 'Japanese':
         return (
             'Chinese source=spoken Japanese name, e.g. '
-            '威拉/薇拉/维拉=ウィラ; 现实世界=リアルワールド; 战争游戏=ウォーゲーム. '
+            '张伟=チョウ・ウェイ; 青云宗=セイウンシュウ. '
             'Do not put English or Chinese on the right side.\n'
         )
     if lang == 'Vietnamese':
         return (
             'Chinese source=spoken Vietnamese or a fixed Latin name, e.g. '
-            '威拉/薇拉/维拉=Willa. No Chinese on the right side.\n'
+            '张伟=Trương Vĩ. No Chinese on the right side.\n'
         )
     return (
         'Chinese source=spoken English name, e.g. '
-        '良心小贩=Honest Peddler; 灵合=Linghe; 祈天柱=Kitenchu; 薇拉=Willa. '
+        '张伟=Zhang Wei; 青云宗=Qingyun Sect. '
     )
+
+
+def _locked_source_glossary(folder):
+    path = os.path.join(folder or '', 'source_bible.json')
+    if not folder or not os.path.isfile(path):
+        return ''
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        return as_bible_text((data or {}).get('glossary'))
+    except Exception:
+        return ''
 
 
 def build_dubbing_bible(info, transcript, target_language, method='OpenAI'):
@@ -203,8 +251,14 @@ def build_dubbing_bible(info, transcript, target_language, method='OpenAI'):
     if len(re.sub(r'\s+', '', body)) < 80:
         logger.warning('對白太少，不寫配音大綱')
         return None
+    locked = as_bible_text((info or {}).get('source_glossary'))
+    lock_note = (
+        f'These Chinese names are already decided. Keep the left side, give one {lang} spelling, do not rename:\n{locked}\n'
+        if locked else ''
+    )
     user = (
         f'Title: "{info.get("title")}" Author: "{info.get("uploader")}".\n'
+        f'{lock_note}'
         f'Dialogue (the only source of truth):\n{body}\n\n'
         f'Write a dubbing bible in {lang} as JSON only:\n'
         '{"title":"", "summary":"", "outline":"", "glossary":"", "voices":""}\n'
@@ -213,15 +267,18 @@ def build_dubbing_bible(info, transcript, target_language, method='OpenAI'):
         'summary: 2-5 sentences of what actually happens.\n'
         'outline: 6-12 short beats in dialogue order.\n'
         'glossary: ONLY people, places, invented skills, and unique named items. '
-        'Do NOT list generic objects such as 篝火/金幣/林場/fire/gold/camp. '
+        'Do NOT list generic objects such as fire, gold, camp, HP, or everyday furniture. '
         f'{_glossary_example(lang)}'
         'Keep those spellings forever. No Chinese on the right side.\n'
         'voices: narrator, system UI, inner monologue/self-talk, and main speakers, plus tone. '
+        'If a walk-on speaker (clerk, waiter, extra) has lines glued onto a lead, name that role '
+        'separately and say which SPEAKER_* id those lines currently sit on. '
+        'Speech in the music bed — opening TV, livestream, recap, narrator/旁白 — is dialogue to keep, not BGM. '
         'Inner monologue and narration may run a bit long.'
     )
     messages = [
         {'role': 'system', 'content': (
-            f'You prepare a {lang} dubbing bible for an anime/game episode. '
+            f'You prepare a {lang} dubbing bible for this episode. '
             'Keep names consistent and speakable. Output JSON only.'
         )},
         {'role': 'user', 'content': user},
@@ -282,6 +339,13 @@ def ensure_episode_bible(folder, info, transcript, target_language, method='Open
         logger.info(f'配音大綱已試過，沿用現有摘要：{folder}')
         return summary
     if needs_translation_refresh(target_language) and method not in ('Google Translate', 'Bing Translate'):
+        try:
+            from tools.cost_tracker import mark_stage
+            mark_stage('撰寫配音大綱…')
+        except Exception:
+            pass
+        info = dict(info or {})
+        info['source_glossary'] = info.get('source_glossary') or _locked_source_glossary(folder)
         bible = build_dubbing_bible(info, transcript, target_language, method)
         if bible:
             summary.update(bible)

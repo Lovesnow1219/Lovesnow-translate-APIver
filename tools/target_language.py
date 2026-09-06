@@ -75,10 +75,10 @@ WORD_BUDGET_LANGUAGES = {
     'Spanish', 'French', 'Polish',
 }
 CHAR_BUDGET_LANGUAGES = {'Thai', 'Japanese'}
-# Spoken tokens per second. Vietnamese spaces every syllable, so English 2 wps
-# would force half-sentences.
+# Spoken tokens per second. English 2.2 matches Fish; 3.0 never triggered tighten.
+# Vietnamese spaces every syllable, so a low English-like pace would force half-sentences.
 WORD_PACE = {
-    'English': 3.0,
+    'English': 2.2,
     'Vietnamese': 5.2,
     'Indonesian': 2.6,
     'Malay': 2.6,
@@ -125,6 +125,14 @@ def split_target_language(label):
 
 def translation_language(label):
     return split_target_language(label)[0]
+
+
+def ui_language_label(language):
+    lang = translation_language(language)
+    for label in TARGET_LANGUAGES:
+        if translation_language(label) == lang:
+            return label
+    return language or 'English'
 
 
 def tts_language(label):
@@ -223,13 +231,13 @@ def load_dub_meta(folder):
     return {}
 
 
-AUDIO_MIX_VERSION = 6
-AUDIO_LAYOUT_VERSION = 3
-TRANSLATION_VERSION = 3
+AUDIO_MIX_VERSION = 7
+AUDIO_LAYOUT_VERSION = 5
+TRANSLATION_VERSION = 7
 LANGUAGE_TRANSLATION_VERSION = {
-    'English': 7,
-    'Vietnamese': 6,
-    'Japanese': 9,
+    'English': 11,
+    'Vietnamese': 8,
+    'Japanese': 11,
 }
 
 
@@ -283,10 +291,103 @@ def purge_asr_junk_folder(folder):
         with open(path, 'w', encoding='utf-8') as handle:
             json.dump(kept, handle, indent=indent, ensure_ascii=False)
         dropped += n
+    if dropped:
+        try:
+            from tools.translation_versions import snapshot_active
+            snapshot_active(folder)
+        except Exception:
+            pass
     return dropped
 
 
-def save_dub_meta(folder, translation=None, tts=None, mix_version=None, layout_version=None, speakers_locked=None, translation_version=None):
+SOURCE_LANGUAGES = [
+    '中文',
+    '粵語',
+    'English',
+    '日本語',
+    '越南文',
+    'Korean',
+    '西班牙文',
+    'French',
+    '泰文',
+    '印尼文',
+    '馬來文',
+    '菲律賓文',
+]
+SOURCE_LANGUAGE_CODES = {
+    '中文': 'zh',
+    '簡體中文': 'zh',
+    '简体中文': 'zh',
+    '繁體中文': 'zh',
+    '繁体中文': 'zh',
+    '粵語': 'zh',
+    '粤语': 'zh',
+    'Cantonese': 'zh',
+    'English': 'en',
+    'en': 'en',
+    '日本語': 'ja',
+    'Japanese': 'ja',
+    'ja': 'ja',
+    '越南文': 'vi',
+    'Vietnamese': 'vi',
+    'vi': 'vi',
+    'Korean': 'ko',
+    'ko': 'ko',
+    '西班牙文': 'es',
+    'Spanish': 'es',
+    'es': 'es',
+    'French': 'fr',
+    'fr': 'fr',
+    '泰文': 'th',
+    'Thai': 'th',
+    'th': 'th',
+    '印尼文': 'id',
+    'Indonesian': 'id',
+    'id': 'id',
+    '馬來文': 'ms',
+    'Malay': 'ms',
+    'ms': 'ms',
+    '菲律賓文': 'tl',
+    'Filipino': 'tl',
+    'tl': 'tl',
+}
+
+
+def asr_language_code(label=None):
+    text = (label or '').strip()
+    if not text or text.lower() in {'auto', 'none'}:
+        return 'zh'
+    if text in SOURCE_LANGUAGE_CODES:
+        return SOURCE_LANGUAGE_CODES[text]
+    stripped = text.replace(_PARTIAL_MARK, '').strip()
+    if stripped in SOURCE_LANGUAGE_CODES:
+        return SOURCE_LANGUAGE_CODES[stripped]
+    if len(text) == 2 and text.isalpha():
+        return text.lower()
+    return 'zh'
+
+
+def recorded_demucs_shifts(folder):
+    raw = load_dub_meta(folder).get('demucs_shifts')
+    if raw is None:
+        return 1
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 1
+
+
+def clear_asr_downstream(folder, keep_bible=True):
+    """Wipe transcript and anything that depends on it. Keep vocal stems unless caller deletes them."""
+    _remove_path(os.path.join(folder, 'transcript.json'))
+    _remove_path(os.path.join(folder, 'asr_review.json'))
+    _remove_path(os.path.join(folder, 'asr_repair.json'))
+    _remove_path(os.path.join(folder, 'source_bible.json'))
+    _remove_path(os.path.join(folder, 'translations'))
+    clear_translation_cache(folder, keep_bible=keep_bible)
+
+
+def save_dub_meta(folder, translation=None, tts=None, mix_version=None, layout_version=None, speakers_locked=None, translation_version=None, demucs_shifts=None, asr_language=None):
     import json
     import os
     meta = load_dub_meta(folder)
@@ -302,6 +403,15 @@ def save_dub_meta(folder, translation=None, tts=None, mix_version=None, layout_v
         meta['speakers_locked'] = bool(speakers_locked)
     if translation_version is not None:
         meta['translation_version'] = int(translation_version)
+        lang = meta.get('translation')
+        if lang:
+            versions = dict(meta.get('versions') or {})
+            versions[lang] = int(translation_version)
+            meta['versions'] = versions
+    if demucs_shifts is not None:
+        meta['demucs_shifts'] = int(demucs_shifts)
+    if asr_language is not None:
+        meta['asr_language'] = asr_language_code(asr_language)
     os.makedirs(folder, exist_ok=True)
     with open(os.path.join(folder, 'dub_meta.json'), 'w', encoding='utf-8') as handle:
         json.dump(meta, handle, indent=2, ensure_ascii=False)
@@ -317,31 +427,113 @@ def _remove_path(path):
         shutil.rmtree(path, ignore_errors=True)
 
 
-def clear_tts_cache(folder):
+def titled_video_path(folder, language=None):
+    """Explorer deliverable: {folder_basename}_{Language}.mp4."""
+    lang = language or load_dub_meta(folder).get('translation') or 'English'
+    lang = translation_language(lang)
+    base = os.path.basename(os.path.normpath(folder))
+    return os.path.join(folder, f'{base}_{lang}.mp4')
+
+
+def drop_working_video_alias(folder, keep_path=None):
+    """Remove leftover video.mp4 so the folder only shows the titled deliverable."""
+    working = os.path.join(folder, 'video.mp4')
+    keep = os.path.abspath(keep_path or titled_video_path(folder))
+    if not os.path.isfile(working):
+        return
+    if os.path.normcase(os.path.abspath(working)) == os.path.normcase(keep):
+        return
+    try:
+        os.remove(working)
+    except OSError:
+        pass
+
+
+def published_video_paths(folder):
+    """Finished dub files: leftover video.mp4 plus {foldername}_{Language}.mp4."""
     import os
-    for name in ('audio_combined.wav', 'audio_tts.wav', 'video.mp4'):
+    paths = [os.path.join(folder, 'video.mp4')]
+    try:
+        paths.append(titled_video_path(folder))
+    except Exception:
+        pass
+    base = os.path.basename(os.path.normpath(folder))
+    try:
+        for name in os.listdir(folder):
+            if name.startswith(base + '_') and name.lower().endswith('.mp4'):
+                paths.append(os.path.join(folder, name))
+    except OSError:
+        pass
+    seen = set()
+    unique = []
+    for path in paths:
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def remove_published_videos(folder):
+    for path in published_video_paths(folder):
+        _remove_path(path)
+
+
+def clear_tts_cache(folder, keep_video=False):
+    import os
+    for name in ('audio_combined.wav', 'audio_tts.wav'):
         _remove_path(os.path.join(folder, name))
+    if not keep_video:
+        for path in published_video_paths(folder):
+            _remove_path(path)
     _remove_path(os.path.join(folder, 'wavs'))
 
 
-def clear_translation_cache(folder, keep_bible=False):
+def clear_translation_cache(folder, keep_bible=False, language=None):
+    import json
     import os
-    _remove_path(os.path.join(folder, 'translation.json'))
+    from tools.translation_versions import lang_key, review_version_path, snapshot_active, version_path
+
+    snapshot_active(folder)
+    lang = lang_key(language) if language else None
+    if lang:
+        _remove_path(version_path(folder, lang))
+        _remove_path(review_version_path(folder, lang))
+        meta = load_dub_meta(folder)
+        if _same_lang(meta.get('translation'), lang, 'translation'):
+            _remove_path(os.path.join(folder, 'translation.json'))
+            _remove_path(os.path.join(folder, 'translation_review.json'))
+        versions = dict(meta.get('versions') or {})
+        versions.pop(lang, None)
+        meta['versions'] = versions
+        if _same_lang(meta.get('translation'), lang, 'translation'):
+            meta['translation_version'] = 0
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, 'dub_meta.json'), 'w', encoding='utf-8') as handle:
+            json.dump(meta, handle, indent=2, ensure_ascii=False)
+    else:
+        _remove_path(os.path.join(folder, 'translation.json'))
+        _remove_path(os.path.join(folder, 'translation_review.json'))
+        save_dub_meta(folder, speakers_locked=False, translation_version=0)
     if not keep_bible:
         _remove_path(os.path.join(folder, 'summary.json'))
     clear_tts_cache(folder)
-    save_dub_meta(folder, speakers_locked=False, translation_version=0)
 
 
 def translation_cache_ok(folder, target_language):
-    import os
-    if not os.path.isfile(os.path.join(folder, 'translation.json')):
+    from tools.translation_versions import has_version, lang_key
+
+    if not has_version(folder, target_language):
         return False
     meta = load_dub_meta(folder)
-    if not _same_lang(meta.get('translation'), target_language, 'translation'):
-        return False
+    lang = lang_key(target_language)
+    versions = meta.get('versions') or {}
+    ver = versions.get(lang)
+    if ver is None and _same_lang(meta.get('translation'), target_language, 'translation'):
+        ver = meta.get('translation_version')
     try:
-        return int(meta.get('translation_version') or 0) >= required_translation_version(target_language)
+        return int(ver or 0) >= required_translation_version(target_language)
     except (TypeError, ValueError):
         return False
 

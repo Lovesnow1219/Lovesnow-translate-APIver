@@ -1,12 +1,6 @@
-Linly-Dubbing
-Copyright (c) Kedreamix and contributors
-https://github.com/Kedreamix/Linly-Dubbing
+Lovesnow-translate
+Copyright (c) Lovesnow
 
-Licensed under the Apache License, Version 2.0.
-You may not use this file except in compliance with the License.
-A copy of the License is in LICENSE.
-
-This repository is a derivative work. It keeps the original Apache-2.0
-license and adds a cloud-API WebUI path (OpenAI ASR/translation, Fish TTS,
-Replicate Demucs), Japanese/Vietnamese dubbing quality, and a post-translation
-review that flags issues without rewriting lines.
+Video AI dubbing and translation. Cloud API WebUI: OpenAI for
+recognition and translation, Fish Audio for TTS, Replicate for
+vocal separation, plus a post-translation review pass.

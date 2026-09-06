@@ -26,11 +26,448 @@ def _spoken_word_budget(duration, target_language='English'):
 
 def _word_slack(target_language):
     lang = translation_language(target_language)
-    if lang == 'English':
-        return 14
     if lang == 'Vietnamese':
-        return 8
+        return 3
     return 2
+
+
+_NAME_STOP = {
+    'the', 'this', 'that', 'you', 'your', 'and', 'but', 'for', 'with', 'from',
+    'have', 'will', 'what', 'when', 'where', 'how', 'why', 'not', 'she', 'he',
+    'they', 'his', 'her', 'our', 'its', 'can', 'don', 'are', 'was', 'were',
+    'been', 'being', 'had', 'has', 'did', 'does', 'all', 'any', 'even', 'still',
+    'just', 'then', 'now', 'yes', 'let', 'get', 'got', 'come', 'came',
+}
+
+
+def _spoken_tokens(text):
+    cleaned = re.sub(r'\[[^\]]*\]', ' ', text or '')
+    cleaned = cleaned.replace('—', ' ').replace('–', ' ').replace('-', ' ')
+    return [part for part in re.findall(r"[A-Za-z0-9']+", cleaned) if part]
+
+
+def _name_tokens(text):
+    names = []
+    for word in _spoken_tokens(text):
+        if len(word) < 3 or word.lower() in _NAME_STOP:
+            continue
+        if word[0].isupper():
+            names.append(word.lower())
+    return names
+
+
+def _source_asks(text):
+    src = (text or '').strip()
+    if re.search(r'[？?]', src):
+        return True
+    return bool(re.search(r'(怎么|怎麼|如何|吗|嗎|么|麼|呢)\s*$', src) or ('怎么' in src) or ('怎麼' in src) or ('如何' in src))
+
+
+def _cjk_clause_count(text):
+    parts = [
+        part for part in re.split(r'[，、。；;！!？?]', text or '')
+        if re.findall(r'[\u4e00-\u9fff]', part)
+    ]
+    return len(parts)
+
+
+def _looks_like_chant(text):
+    """Short parallel beats (锤玉成云，碎波成霜，以意易容形), not a long prose sentence."""
+    parts = [
+        part.strip()
+        for part in re.split(r'[，、。；;！!？?]', text or '')
+        if re.findall(r'[\u4e00-\u9fff]', part)
+    ]
+    if len(parts) < 3:
+        return False
+    sizes = [len(re.findall(r'[\u4e00-\u9fff]', part)) for part in parts]
+    if max(sizes) > 6 or min(sizes) < 3:
+        return False
+    return not re.search(r'[的了着過过]', text or '')
+
+
+def _is_technique_source(text):
+    src = text or ''
+    return bool(
+        re.search(r'[·・]', src)
+        or re.search(r'[剑劍诀訣阵陣]', src)
+        or _looks_like_chant(src)
+    )
+
+
+def _latin_source(text):
+    src = (text or '').strip()
+    if not src or re.search(r'[\u4e00-\u9fff]', src):
+        return False
+    return len(re.findall(r'[A-Za-z]', src)) >= 4
+
+
+def _foreign_asr_source(text):
+    src = (text or '').strip()
+    if not src:
+        return False
+    if _latin_source(src):
+        return True
+    if re.search(r'[\u4e00-\u9fff]', src):
+        return False
+    return bool(re.search(r'[\u3040-\u30ff]', src))
+
+
+def _mostly_cjk_episode(transcript):
+    lines = [line for line in (transcript or []) if (line.get('text') or '').strip()]
+    if not lines:
+        return False
+    cjk = sum(1 for line in lines if re.search(r'[\u4e00-\u9fff]', line.get('text') or ''))
+    need = 3 if len(lines) < 8 else int(0.6 * len(lines))
+    return cjk >= max(need, 1)
+
+
+def _glued_two_mouths(text):
+    return bool(re.search(r'\s/\s', text or ''))
+
+
+def _needs_empty_vocal(line):
+    src = ((line or {}).get('text') if isinstance(line, dict) else line) or ''
+    src = src.strip()
+    dub = ((line or {}).get('translation') if isinstance(line, dict) else '') or ''
+    if dub.strip() or not src or is_asr_junk(src):
+        return False
+    from tools.vocal_particles import is_particle_card
+    if is_particle_card(src):
+        return False
+    compact = re.sub(r'[\s,，。！？!?、…]+', '', src)
+    return bool(re.fullmatch(r'[\u4e00-\u9fff]{1,2}', compact))
+
+
+def _technique_crushed(src, dub):
+    if not _is_technique_source(src):
+        return False
+    words = _spoken_tokens(dub)
+    chars = len(re.findall(r'[\u4e00-\u9fff]', src or ''))
+    clauses = _cjk_clause_count(src)
+    spoken = dub or ''
+    if clauses >= 3 and ('—' in spoken or '–' in spoken) and 0 < len(words) <= clauses * 2:
+        return True
+    if clauses >= 3 and len(words) < clauses + 1:
+        return True
+    return bool(re.search(r'[·・]', src or '')) and chars >= 10 and 0 < len(words) <= 4
+
+
+def _invents_other_language(src, sug):
+    if not _latin_source(src):
+        return False
+    src_toks = {word.lower() for word in _spoken_tokens(src)}
+    sug_toks = {word.lower() for word in _spoken_tokens(sug)}
+    if len(sug_toks) < 2:
+        return False
+    return not (src_toks & sug_toks)
+
+
+_ELLIPSIS_END_RE = re.compile(r'(…+|\.{3,}|。。。)\s*$')
+_STAMMER_FLIP_RE = re.compile(r'(…+|\.{3,}|。。。)\s*[不没沒][!！]?$')
+_GUESS_WORD_RE = re.compile(
+    r'\b(somehow|anyway|i guess|i suppose|or something)\b',
+    re.I,
+)
+_VOCATIVE_CMD_RE = re.compile(r'[\u4e00-\u9fff]{2,}[，,]\s*[上来去滚杀]')
+_FIRST_MOUTH_RE = re.compile(r'[我咱俺]|好啊|告诉|那我')
+_TOLD_RE = re.compile(r"\b(i('ll| will)? tell|i('ll| will)? confess|fine,? i)\b", re.I)
+_ORDER_RE = re.compile(r'\b(hall|move!?|guards?|seize|take (him|her)|bring (him|her))\b', re.I)
+_STAMMER_KEEP_RE = re.compile(r'\b(y-?yes|n-?no|no)\b', re.I)
+_CONFESS_RE = re.compile(
+    r"\b(i('ll| will)? tell|i('ll| will)? confess|fine,? i|admit|alright|okay)\b",
+    re.I,
+)
+
+
+def _source_ellipsis(text):
+    return bool(_ELLIPSIS_END_RE.search((text or '').rstrip()))
+
+
+def _source_stammer_flip(text):
+    """是、是、是……不！ — agree, trail off, then reverse. Not a finished thought."""
+    return bool(_STAMMER_FLIP_RE.search((text or '').strip()))
+
+
+def _rewrites_stammer_flip(src, dub):
+    if not _source_stammer_flip(src):
+        return False
+    spoken = (dub or '').strip()
+    if not spoken:
+        return False
+    if _CONFESS_RE.search(spoken):
+        return True
+    if _STAMMER_KEEP_RE.search(spoken) and re.search(r'(\.\.\.|…|—)', spoken):
+        return False
+    if _ELLIPSIS_END_RE.search(spoken) or spoken.endswith(('—', '--')):
+        return False
+    return bool(re.search(r'[.!?]"?$', spoken))
+
+
+def _norm_latin(text):
+    return re.sub(r'[^a-z0-9]+', ' ', (text or '').lower()).strip()
+
+
+def _rewrites_foreign_asr(src, dub):
+    if not _foreign_asr_source(src):
+        return False
+    left, right = _norm_latin(src), _norm_latin(dub)
+    if not right or left == right:
+        return False
+    return True
+
+
+def _guesses_unfinished(src, dub):
+    if _rewrites_stammer_flip(src, dub):
+        return True
+    if not _source_ellipsis(src):
+        return False
+    spoken = (dub or '').strip()
+    if not spoken:
+        return False
+    if _GUESS_WORD_RE.search(spoken):
+        return True
+    if re.search(r'(\.\.\.|…)\s+\S', spoken):
+        return True
+    if _ELLIPSIS_END_RE.search(spoken) or spoken.endswith(('—', '--')):
+        return False
+    return bool(re.search(r'[.!?]"?$', spoken))
+
+
+def should_not_tighten(text):
+    """Paper/wav shorten must not touch trail-offs, stammed flips, chants, or foreign ASR."""
+    src = (text or '').strip()
+    if not src:
+        return False
+    if _foreign_asr_source(src):
+        return True
+    if _source_ellipsis(src) or _source_stammer_flip(src):
+        return True
+    if _looks_like_chant(src) or re.search(r'[·・]', src):
+        return True
+    return False
+
+
+def restores_voice(source, current, suggest, target_language='English'):
+    """True when suggest undoes a guessed, crushed, or glued shorten."""
+    if is_chinese_target(target_language):
+        return False
+    src = (source or '').strip()
+    old = (current or '').strip()
+    sug = (suggest or '').strip()
+    if not sug or sug == old:
+        return False
+    if _guesses_unfinished(src, old) and not _guesses_unfinished(src, sug):
+        return True
+    if _technique_crushed(src, old) and not _technique_crushed(src, sug):
+        return True
+    if _rewrites_foreign_asr(src, old) and not _rewrites_foreign_asr(src, sug):
+        return True
+    if _speaks_both_mouths(src, old) and not _speaks_both_mouths(src, sug) and not _glued_two_mouths(sug):
+        return True
+    if _sense_broken(src, old) and not _sense_broken(src, sug):
+        return True
+    return False
+
+
+def _two_mouth_source(src):
+    parts = [
+        part.strip()
+        for part in re.split(r'[。！？!?]', src or '')
+        if re.findall(r'[\u4e00-\u9fff]', part)
+    ]
+    if len(parts) < 2:
+        return False
+    return bool(_VOCATIVE_CMD_RE.search(parts[-1]) and _FIRST_MOUTH_RE.search(''.join(parts[:-1])))
+
+
+def _speaks_both_mouths(src, dub):
+    if not _two_mouth_source(src):
+        return False
+    spoken = dub or ''
+    sentences = [part for part in re.split(r'[.!?]+', spoken) if part.strip()]
+    if len(sentences) >= 2:
+        return True
+    return bool(_TOLD_RE.search(spoken) and _ORDER_RE.search(spoken))
+
+
+_EXPERIENCE_VERB_RE = re.compile(r'去过|去過|看过|看過|听过|聽過|到过|到過|见过|見過')
+_QUESTION_VERB_EN = re.compile(
+    r'\b(seen|been|gone|go|heard|hear|visited|visit|ever|know|met|meet|reached|reach|entered|enter)\b',
+    re.I,
+)
+_AIR_NEG_SRC = re.compile(r'空气中没|空氣中沒|空气中沒|空氣中没|[中里裡]没有|[中里裡]沒有')
+_PLACE_EN = re.compile(r'\b(in the air|in the wind|around here|here)\b', re.I)
+_SPEAR_CHAR = re.compile(r'[枪槍]')
+_MODERN_GUN_SRC = re.compile(
+    r'手枪|手槍|开枪|開槍|子弹|子彈|枪械|槍械|步枪|步槍|'
+    r'火枪|火槍|鸟枪|鳥槍|猎枪|獵槍|机枪|機槍|烟枪|煙槍|'
+    r'枪决|槍決|枪毙|槍斃|枪击|槍擊|水枪|水槍'
+)
+_GUN_EN = re.compile(r'\bguns?\b', re.I)
+_REALM_RIVER_SRC = re.compile(
+    r'(?:寻常|尋常|平常|普通)?河道\s*[巔巅]?峰|'
+    r'河道\s*(?:强者|期|境|大成)|'
+    r'(?:寻常|尋常|平常|普通)河道'
+)
+_CHANNEL_EN = re.compile(r'\b(channels?|waterways?|rivers?)\b', re.I)
+_TITLED_HERO_SRC = re.compile(r'[称稱][\u4e00-\u9fff]{2,8}俊[傑杰]')
+_GENERIC_HERO_NAMES = {'hero', 'heroes', 'heaven', 'earth', 'unashamed'}
+
+
+def _drops_question_verb(src, dub):
+    if not _source_asks(src) or not _EXPERIENCE_VERB_RE.search(src or ''):
+        return False
+    return not bool(_QUESTION_VERB_EN.search(dub or ''))
+
+
+def _drops_location_negation(src, dub):
+    if not _AIR_NEG_SRC.search(src or ''):
+        return False
+    spoken = dub or ''
+    if _PLACE_EN.search(spoken):
+        return False
+    first = re.split(r'[.!?]', spoken.strip(), 1)[0].strip()
+    if re.match(r'^no\b', first, re.I) and not re.search(r'\b(in|here|around)\b', first, re.I):
+        return bool(re.search(r'空气|空氣|这里|這裡', src or ''))
+    return False
+
+
+def _spear_as_gun(src, dub):
+    if _MODERN_GUN_SRC.search(src or '') or not _GUN_EN.search(dub or ''):
+        return False
+    return bool(_SPEAR_CHAR.search(src or ''))
+
+
+def _realm_as_waterway(src, dub):
+    if not _REALM_RIVER_SRC.search(src or ''):
+        return False
+    return bool(_CHANNEL_EN.search(dub or ''))
+
+
+def _drops_heaven_earth(src, dub):
+    if '天地' not in (src or ''):
+        return False
+    spoken = dub or ''
+    if not re.search(r'\bheavens?\b', spoken, re.I):
+        return False
+    return not bool(re.search(r'\bearth\b', spoken, re.I))
+
+
+def _crushes_titled_hero(src, dub):
+    if not _TITLED_HERO_SRC.search(src or ''):
+        return False
+    spoken = (dub or '').strip()
+    if not re.match(r'^\s*(?:an? |the )?hero(?:es)?\b', spoken, re.I):
+        return False
+    if re.search(r'\bhero(?:es)?\s+(of|from|in)\b', spoken, re.I):
+        return False
+    leftover = set(_name_tokens(spoken)) - _GENERIC_HERO_NAMES
+    return not leftover
+
+
+def sense_issue(src, dub):
+    """Chinese issue string when meaning was rewritten into the wrong thing."""
+    if _drops_question_verb(src, dub):
+        return '問句被收成電報，動詞沒了'
+    if _drops_location_negation(src, dub):
+        return '否定句丟了處所'
+    if _spear_as_gun(src, dub):
+        return '冷兵器的槍被譯成 gun'
+    if _realm_as_waterway(src, dub):
+        return '境界近音被譯成河道'
+    if _drops_heaven_earth(src, dub):
+        return '天地被收成只有 Heaven'
+    if _crushes_titled_hero(src, dub):
+        return '稱〇俊傑被收成 Hero'
+    return ''
+
+
+def _sense_broken(src, dub):
+    return bool(sense_issue(src, dub))
+
+
+def glossary_forced_on_junk(src, dub, glossary_pairs):
+    """True when a short ASR hash was replaced by a glossary name not in the source."""
+    han = re.findall(r'[\u4e00-\u9fff]', src or '')
+    if not (3 <= len(han) <= 8):
+        return None
+    spoken = re.sub(r'[.!?…]+$', '', (dub or '').strip())
+    if not spoken:
+        return None
+    for cn, dst in glossary_pairs or []:
+        if not dst or len(cn) < 2:
+            continue
+        if cn in (src or ''):
+            continue
+        if spoken.lower() == dst.strip().lower():
+            return cn, dst
+    return None
+
+
+def suggest_wrecks_voice(source, current, suggest, target_language='English'):
+    """True when a rewrite strips speech-act, names, or turns into a bark."""
+    if is_chinese_target(target_language):
+        return False
+    src = (source or '').strip()
+    old = (current or '').strip()
+    sug = (suggest or '').strip()
+    if not sug or sug == old:
+        return False
+    from tools.vocal_particles import is_particle_card, particle_translation
+
+    if is_particle_card(src):
+        compact = ''.join(ch for ch in src if ch.strip() and ch not in '，,。！？!?、…')
+        spoken = ''.join(_spoken_tokens(sug)).lower()
+        if compact in {'嘿', '嘿嘿', '哈哈', '嘻嘻'} and spoken in {'ha', 'hah'}:
+            return True
+        mapped = particle_translation(src, target_language)
+        if mapped and spoken and spoken != ''.join(_spoken_tokens(mapped)).lower() and spoken in {'ha', 'hah'}:
+            return True
+        return False
+
+    if restores_voice(src, old, sug, target_language):
+        return False
+
+    src_chars = len(re.findall(r'[\u4e00-\u9fff]', src))
+    sug_words = _spoken_tokens(sug)
+    old_words = _spoken_tokens(old)
+    if _source_asks(src) and '?' not in sug and '？' not in sug:
+        return True
+    if src_chars >= 5 and len(sug_words) <= 1:
+        return True
+    if old and len(old_words) >= 4 and len(sug_words) <= 2:
+        return True
+    old_names = set(_name_tokens(old))
+    sug_names = set(_name_tokens(sug))
+    if old_names and not (old_names & sug_names) and src_chars >= 4:
+        return True
+    if len(old_names) >= 2 and len(old_names & sug_names) < 2 and src_chars >= 6:
+        return True
+    if not _source_stammer_flip(src):
+        clauses = _cjk_clause_count(src)
+        if clauses >= 3 and len(sug_words) < clauses + 1:
+            if not (_looks_like_chant(src) and len(sug_words) >= max(len(old_words), 1)):
+                return True
+    if _is_technique_source(src):
+        dropped = old_names - sug_names - {'swords', 'sword', 'art', 'arts', 'form', 'system'}
+        if dropped:
+            return True
+        if src_chars >= 10 and old and len(sug_words) <= 4 and len(sug_words) < len(old_words):
+            return True
+    if _glued_two_mouths(sug) and not _glued_two_mouths(old):
+        return True
+    if _invents_other_language(src, sug):
+        return True
+    if _rewrites_foreign_asr(src, sug):
+        return True
+    if _guesses_unfinished(src, sug):
+        return True
+    if _speaks_both_mouths(src, sug):
+        return True
+    if _sense_broken(src, sug):
+        return True
+    return False
 
 _STUMP_PHRASES = {
     'congratulations',
@@ -108,15 +545,23 @@ def _apportion_source(source, parts):
         take = max(1, int(round(n * weight / total)))
         end = min(n, cursor + take)
         snapped = None
-        for j in range(end, min(n, end + 6)):
+        mid_cjk = (
+            end < n
+            and '\u4e00' <= source[end - 1] <= '\u9fff'
+            and '\u4e00' <= source[end] <= '\u9fff'
+        )
+        window = 12 if mid_cjk else 6
+        for j in range(end, min(n, end + window)):
             if source[j - 1:j] in '。！？，、,.!? ':
                 snapped = j
                 break
         if snapped is None:
-            for j in range(end, max(cursor + 1, end - 6), -1):
+            for j in range(end, max(cursor + 1, end - window), -1):
                 if source[j - 1:j] in '。！？，、,.!? ':
                     snapped = j
                     break
+        if snapped is None and mid_cjk:
+            snapped = n if i >= len(parts) - 2 else end
         end = snapped or end
         if end <= cursor:
             end = min(n, cursor + take)
@@ -280,6 +725,35 @@ def _incomplete_reason(text, cleaned, target_language, duration):
     leftover = leftover_chinese_reason(cleaned, target_language)
     if leftover:
         return leftover
+    if _guesses_unfinished(text, cleaned):
+        return (
+            'The Chinese trails off or flips after ……. Keep the stammer or the named thing '
+            'and trail off. Do not confess or finish the thought. Output only the line.'
+        )
+    if _technique_crushed(text, cleaned):
+        return (
+            'Keep every chant/technique clause. Cut filler only. '
+            'Do not crush it into an em-dash compound. Output only the line.'
+        )
+    if _rewrites_foreign_asr(text, cleaned):
+        return (
+            'Copy the source as-is. Do not rewrite recognized English or Latin. '
+            'Output only the line.'
+        )
+    if _speaks_both_mouths(text, cleaned):
+        return (
+            'This card has two speakers. Translate only the first speaker. '
+            "Do not speak the other mouth's command. Output only the line."
+        )
+    if _sense_broken(text, cleaned):
+        return (
+            'Keep the verb, the place, and the real weapon or realm word. '
+            'Do not telegraph. A spear is not a gun. A cultivation realm is not a river. '
+            'Heaven and Earth stay together. A titled hero keeps the place name. '
+            'Output only the line.'
+        )
+    if _source_ellipsis(text) or _source_stammer_flip(text):
+        return None
     lang = translation_language(target_language)
     compact = _source_chars(text)
     if lang in {'English', 'Vietnamese', 'Japanese'}:
@@ -323,13 +797,6 @@ def _incomplete_reason(text, cleaned, target_language, duration):
                     'The translation dropped clauses. Translate the whole sentence into spoken English. '
                     'Output only the line.'
                 )
-            if compact >= 16:
-                bits = [bit.strip() for bit in re.split(r'[.!?]+', cleaned) if bit.strip()]
-                if len(bits) >= 3 and all(len(bit.split()) <= 2 for bit in bits):
-                    return (
-                        'Do not telegraph. Write a spoken English sentence. '
-                        'Output only the line.'
-                    )
         return None
     if lang == 'Japanese':
         if compact >= 6 and HAN_RE.search(cleaned) and not KANA_RE.search(cleaned):
@@ -337,9 +804,9 @@ def _incomplete_reason(text, cleaned, target_language, duration):
                 'Kanji-only lines are read as Chinese. Add hiragana or katakana. '
                 'Output only the Japanese line.'
             )
-        if JA_CN_LEFT_RE.search(cleaned) or re.search(r'[威薇维]拉|本小姐', cleaned):
+        if JA_CN_LEFT_RE.search(cleaned):
             return (
-                'Do not leave Chinese names or particles. Willa is ウィラ. '
+                'Do not leave Chinese particles. Use the outline glossary. '
                 'Output only the Japanese line.'
             )
         han = len(HAN_RE.findall(cleaned))
@@ -384,11 +851,11 @@ def _extra_budget_scale(line):
     speaker = str((line or {}).get('speaker') or '').strip().lower()
     text = (line or {}).get('text') or ''
     if speaker in _NARRATOR_SPEAKERS or speaker.startswith('narrat'):
-        return 1.4
+        return 1.1
     if _SYSTEM_UI_RE.search(text):
-        return 1.35
+        return 1.08
     if '心想' in text or text.startswith('（') or text.startswith('('):
-        return 1.25
+        return 1.05
     return 1.0
 
 
@@ -402,14 +869,19 @@ def _translate_user_content(text, duration, target_language, budget_scale=1.0, e
                 f'{note}Translate the whole line into spoken Vietnamese in {duration:.1f}s, '
                 f'up to {budget} syllables (one space per syllable). '
                 f'Keep every clause; speak numbers (không trên mười, not 0/10). '
-                f'Keep 嗯/呵/哼/嘿嘿 as Ừ/Hề/Hừ/He he. 本小姐 is the speaker (tôi). '
+                f'Keep 嗯/呵/哼/嘿嘿 as Ừ/Hề/Hừ/He he. '
                 f'Do not end with … unless the source is unfinished:"{text}"'
             )
         if lang == 'English':
             return (
-                f'{note}Translate the whole line into spoken English, about {duration:.1f}s '
-                f'({budget} words is a guide, a bit more is OK). '
+                f'{note}Translate the whole line into spoken English in {duration:.1f}s, '
+                f'max {budget} words. Fish TTS is slow; do not overflow the slot. '
                 f'Use the outline names. Keep meaning, emotion, and 啊吧呢呀嗯呵哼. '
+                f'If the Chinese is angry, scared, or mocking, do not sound polite. '
+                f'If the Chinese trails off with ……, keep the named thing and trail off; '
+                f'do not add somehow or finish the thought. '
+                f'If this card glued two speakers, translate only the first mouth. '
+                f'If the line is already Latin letters or kana, copy it; do not clean it. '
                 f'Do not add names that are not in this line. Do not chop into fragments:"{text}"'
             )
         return f'{note}Translate in {duration:.1f}s, max {budget} {lang} words:"{text}"'
@@ -419,9 +891,9 @@ def _translate_user_content(text, duration, target_language, budget_scale=1.0, e
             return (
                 f'{note}Translate the whole line into spoken Japanese in {duration:.1f}s, '
                 f'up to {budget} characters. Mixed Japanese, not Chinese calques. '
-                f'ウィラ not 薇拉. リアルワールド/マネーカード/ウォーゲーム/金庫, not 現実世界貨幣変換. '
-                f'Keep レベル99 and 30日 as digits. Never 0/10, %, or +. '
-                f'Keep 嗯/呵/哼/嘿嘿 as ん/ふふ/ふん/へへ. 本小姐 is この私. Keep every clause:"{text}"'
+                f'Use the outline glossary for names (katakana). Do not calque Chinese compounds. '
+                f'Never write 0/10, %, or +. '
+                f'Keep 嗯/呵/哼/嘿嘿 as ん/ふふ/ふん/へへ. Keep every clause:"{text}"'
             )
         return f'{note}Translate in {duration:.1f}s, max {budget} {lang} characters:"{text}"'
     return f'{note}Translate into spoken {lang}:"{text}"'
@@ -479,63 +951,19 @@ def valid_translation(text, translation, target_language='简体中文', duratio
 
     return True, translation_postprocess(translation, target_language)
 def split_sentences(translation, use_char_based_end=True, target_language='English'):
+    """Keep one source card as one dubbed card.
+
+    Target-language periods must not re-slice the Chinese. Long source
+    lines are split before translation (ASR polish / split_long_segments).
+    """
+    del use_char_based_end, target_language
     output_data = []
-    for item in translation:
-        start = item['start']
-        text = item['text']
-        speaker = item['speaker']
-        translation_text = item['translation']
-        extra = {
-            key: value for key, value in item.items()
-            if key not in {'start', 'end', 'text', 'speaker', 'translation', 'orig_start', 'orig_end'}
-        }
-
-        if not translation_text or not str(translation_text).strip():
-            output_data.append({
-                **extra,
-                "start": round(start, 3),
-                "end": round(item['end'], 3),
-                "text": text,
-                "speaker": speaker,
-                "translation": '' if is_asr_junk(text) or not is_chinese_target(target_language) else (translation_text or "未翻译"),
-            })
-            continue
-
-        sentences = merge_split_sentences(
-            split_text_into_sentences(translation_text), target_language,
-        )
-        if not sentences:
-            sentences = [translation_text]
-
-        if use_char_based_end:
-            duration_per_char = (item['end'] - item['start']) / max(1, len(translation_text))
-        else:
-            duration_per_char = 0
-
-        sources = _apportion_source(text, sentences)
-        for i, sentence in enumerate(sentences):
-            if use_char_based_end:
-                sentence_end = start + duration_per_char * len(sentence)
-            else:
-                sentence_end = item['end']
-            if i == len(sentences) - 1:
-                sentence_end = item['end']
-            source = sources[i] if i < len(sources) and sources[i] else text
-            child = {
-                **extra,
-                "start": round(start, 3),
-                "end": round(sentence_end, 3),
-                "orig_start": round(start, 3),
-                "orig_end": round(sentence_end, 3),
-                "text": source,
-                "speaker": speaker,
-                "translation": sentence,
-            }
-            if source != text:
-                child['parent_text'] = text
-            output_data.append(child)
-            if use_char_based_end:
-                start = sentence_end
-
+    for item in translation or []:
+        line = dict(item)
+        if line.get('orig_start') is None:
+            line['orig_start'] = line.get('start')
+        if line.get('orig_end') is None:
+            line['orig_end'] = line.get('end')
+        output_data.append(line)
     return output_data
 

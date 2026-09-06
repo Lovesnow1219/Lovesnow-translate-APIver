@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from loguru import logger
 
-_SESSION = ContextVar('linly_cost_session', default=None)
+_SESSION = ContextVar('lovesnow_cost_session', default=None)
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_SESSION = None
 _LAST_MARKDOWNS = []
@@ -20,6 +20,7 @@ PIPELINE_STEPS = [
     ('demucs', '人聲分離'),
     ('asr', '語音識別'),
     ('translate', '字幕翻譯'),
+    ('review', '字幕審核修改'),
     ('tts', '語音合成'),
     ('mux', '影片合成'),
 ]
@@ -27,18 +28,18 @@ PIPELINE_STEPS = [
 KIND_TO_STEP = {
     'demucs_replicate': 'demucs',
     'asr': 'asr',
-    'asr_qwen': 'asr',
     'translate': 'translate',
+    'review': 'review',
     'llm': 'translate',
     'chat': 'translate',
     'tts_fish': 'tts',
-    'tts_openai': 'tts',
 }
 
 _STAGE_HINTS = (
     ('prepare', ('準備處理', '準備', '初始化', '下載影片', '下載', '本地', '取得影片')),
     ('demucs', ('人聲分離',)),
     ('asr', ('語音識別', '智慧語音', 'ASR')),
+    ('review', ('字幕審核', '審稿', '單句 AI', '整集連貫')),
     ('translate', ('字幕翻譯', '翻譯')),
     ('tts', ('語音合成', 'TTS')),
     ('mux', ('影片合成',)),
@@ -139,14 +140,92 @@ def match_stage_id(name):
     return None
 
 
+def rate_note(model, kind=None):
+    """List price for a used model, shown next to each cost line."""
+    kind = kind or ''
+    name = (model or '').strip()
+    low = name.lower()
+    if kind == 'tts_fish' or 's2.1' in low:
+        if 'free' in low:
+            return '$0（免費檔）'
+        return f'${_env_float("FISH_USD_PER_1M_BYTES", 15.0):g} / 百萬 UTF-8 bytes'
+    if kind == 'demucs_replicate':
+        return 'Replicate T4 $0.000225 / 秒'
+    inn, out = token_rates(low)
+    return f'${inn:g} / ${out:g} 每百萬 token'
+
+
+def entry_usd(entry):
+    kind = entry.get('kind')
+    if kind == 'review':
+        return round(_price_entry(entry), 6)
+    return float(entry.get('usd') or 0)
+
+
 def group_entries(entries):
     grouped = {}
     for entry in entries or []:
         key = (entry.get('provider') or '-', entry.get('kind') or '-', entry.get('model') or '-')
-        item = grouped.setdefault(key, {'usd': 0.0, 'count': 0})
-        item['usd'] += float(entry.get('usd') or 0)
+        item = grouped.setdefault(key, {'usd': 0.0, 'count': 0, 'kind': key[1], 'model': key[2]})
+        item['usd'] += entry_usd(entry)
         item['count'] += 1
     return grouped
+
+
+def _detail_line(provider, kind, model, item):
+    count = f' ×{item["count"]}' if item['count'] > 1 else ''
+    note = rate_note(model, kind) if model and model != '-' else ''
+    money = format_money(item['usd'])
+    if note:
+        return f'- {provider} / {kind} / {model}{count}：{note} · {money}'
+    return f'- {provider} / {kind} / {model}{count}：{money}'
+
+
+def _used_rate_footer(entries):
+    seen = []
+    keys = set()
+    for entry in entries or []:
+        model = (entry.get('model') or '').strip()
+        kind = entry.get('kind') or ''
+        if not model:
+            continue
+        pair = (model, kind)
+        if pair in keys:
+            continue
+        keys.add(pair)
+        seen.append(pair)
+    lines = ['費率（本趟用到的模型，官方牌價）：']
+    if seen:
+        for model, kind in seen:
+            lines.append(f'- {model}：{rate_note(model, kind)}')
+    else:
+        lines.append('- gpt-5.6-terra：$2 / $12 每百萬 token')
+        lines.append('- gpt-5.6-sol：$4 / $20 每百萬 token')
+    lines.append('實際以帳單為準。免費額可能把實付打成 $0。')
+    return lines
+
+
+def _steps_for_display(last):
+    last_steps = {
+        step.get('id'): step
+        for step in (last.get('steps') or [])
+        if isinstance(step, dict) and step.get('id')
+    }
+    by_usd = {key: 0.0 for key, _ in PIPELINE_STEPS}
+    for entry in last.get('entries') or []:
+        step_id = KIND_TO_STEP.get(entry.get('kind'))
+        if step_id in by_usd:
+            by_usd[step_id] += entry_usd(entry)
+    rows = []
+    for key, name in PIPELINE_STEPS:
+        prev = last_steps.get(key) or {}
+        rows.append({
+            'id': key,
+            'name': name,
+            'usd': round(by_usd[key], 6),
+            'seconds': prev.get('seconds'),
+        })
+    return rows
 
 
 def format_duration(seconds):
@@ -230,14 +309,14 @@ class CostSession:
 
     def total_usd(self):
         with self._lock:
-            return round(sum(float(e.get('usd') or 0) for e in self.entries), 6)
+            return round(sum(entry_usd(e) for e in self.entries), 6)
 
     def step_usd(self, step_id):
         total = 0.0
         with self._lock:
             for entry in self.entries:
                 if KIND_TO_STEP.get(entry.get('kind')) == step_id:
-                    total += float(entry.get('usd') or 0)
+                    total += entry_usd(entry)
         return round(total, 6)
 
     def apply_stage(self, name, percent=None):
@@ -428,12 +507,11 @@ def live_status_text(percent=None, stage=None, session=None):
     grouped = group_entries(session.entries if session else [])
     if grouped:
         for (provider, kind, model), item in grouped.items():
-            count = f' ×{item["count"]}' if item['count'] > 1 else ''
-            lines.append(f'- {provider} / {kind} / {model}{count}：{format_money(item["usd"])}')
+            lines.append(_detail_line(provider, kind, model, item))
     else:
         lines.append('（尚無 API 花費，開始打 API 後會即時更新）')
     lines.append('')
-    lines.append('實際以各平台帳單為準。')
+    lines.extend(_used_rate_footer(session.entries if session else []))
     return '\n'.join(lines)
 
 
@@ -460,17 +538,16 @@ def live_cost_markdown():
         lines.append('')
         lines.append('明細：')
         for (provider, kind, model), item in grouped.items():
-            count = f' ×{item["count"]}' if item['count'] > 1 else ''
-            lines.append(f'- {provider} / {kind} / {model}{count}：{format_money(item["usd"])}')
+            lines.append(_detail_line(provider, kind, model, item))
     lines.append('')
-    lines.append('實際以各平台帳單為準。')
+    lines.extend(_used_rate_footer(session.entries))
     return '\n'.join(lines)
 
 
 def _price_entry(entry):
     kind = entry.get('kind')
     model = (entry.get('model') or '').lower()
-    if kind in ('translate', 'llm', 'chat'):
+    if kind in ('translate', 'review', 'llm', 'chat'):
         inn, out = token_rates(model)
         return (entry.get('input_tokens') or 0) / 1_000_000 * inn + (entry.get('output_tokens') or 0) / 1_000_000 * out
     if kind == 'asr':
@@ -488,9 +565,6 @@ def _price_entry(entry):
             return 0.0
         nbytes = int(entry.get('utf8_bytes') or 0)
         return nbytes / 1_000_000 * _env_float('FISH_USD_PER_1M_BYTES', 15.0)
-    if kind == 'tts_openai':
-        chars = int(entry.get('characters') or 0)
-        return chars / 1_000_000 * _env_float('OPENAI_TTS_USD_PER_1M_CHARS', 15.0)
     if kind == 'demucs_replicate':
         seconds = float(entry.get('seconds') or 0)
         per_min = os.getenv('REPLICATE_DEMUCS_USD_PER_MINUTE')
@@ -500,9 +574,6 @@ def _price_entry(entry):
             except (TypeError, ValueError):
                 pass
         return seconds * _env_float('REPLICATE_T4_USD_PER_SECOND', 0.000225)
-    if kind == 'asr_qwen':
-        minutes = float(entry.get('seconds') or 0) / 60.0
-        return minutes * _env_float('QWEN_ASR_USD_PER_MINUTE', 0.002)
     return 0.0
 
 
@@ -553,47 +624,42 @@ def _short_folder(folder):
     return '/'.join(parts[-2:])
 
 
+def _run_usd(run):
+    entries = (run or {}).get('entries') or []
+    if entries:
+        return round(sum(entry_usd(e) for e in entries), 6)
+    return float((run or {}).get('total_usd') or 0)
+
+
 def format_snapshot(folder, history):
     if not history:
         return f'{folder or ""}：尚無成本紀錄'
     last = history.get('last_run') or {}
+    runs = history.get('runs') or ([last] if last else [])
+    last_usd = _run_usd(last)
+    history_usd = round(sum(_run_usd(run) for run in runs), 6)
     folder_label = _short_folder(folder or history.get('folder') or '')
     lines = [
         f'### 本片 API 成本（估計）',
         f'資料夾：`{folder_label}`' if folder_label else '資料夾：-',
-        f'**本片累計：{format_money(history.get("total_usd"))}**（{len(history.get("runs") or [])} 次處理）',
-        f'最近一次：{format_money(last.get("total_usd"))}',
+        f'**本片累計：{format_money(history_usd)}**（{len(runs)} 次處理）',
+        f'最近一次：{format_money(last_usd)}',
     ]
     if last.get('total_seconds') is not None:
         lines.append(f'最近一次總耗時：{format_duration(last.get("total_seconds"))}')
     lines.extend(['', '各步驟（最近一次）'])
     last_entries = last.get('entries') or []
-    last_steps = last.get('steps')
-    if last_steps:
-        for step in last_steps:
-            timed = f' · {format_duration(step.get("seconds"))}' if step.get('seconds') else ''
-            lines.append(f'- {step.get("name")}：{format_money(step.get("usd"))}{timed}')
-    else:
-        by_step = {key: 0.0 for key, _ in PIPELINE_STEPS}
-        for entry in last_entries:
-            step_id = KIND_TO_STEP.get(entry.get('kind'))
-            if step_id:
-                by_step[step_id] += float(entry.get('usd') or 0)
-        for key, name in PIPELINE_STEPS:
-            lines.append(f'- {name}：{format_money(by_step.get(key))}')
+    for step in _steps_for_display(last):
+        timed = f' · {format_duration(step.get("seconds"))}' if step.get('seconds') else ''
+        lines.append(f'- {step.get("name")}：{format_money(step.get("usd"))}{timed}')
     grouped = group_entries(last_entries)
     if grouped:
         lines.append('')
         lines.append('明細：')
         for (provider, kind, model), item in grouped.items():
-            count = f' ×{item["count"]}' if item['count'] > 1 else ''
-            lines.append(f'- {provider} / {kind} / {model}{count}：{format_money(item["usd"])}')
+            lines.append(_detail_line(provider, kind, model, item))
     lines.append('')
-    lines.append(
-        '費率（官方，2026-08-27）：ASR gpt-4o-transcribe-diarize $2.50 / $10 每百萬 token；'
-        'Luna $0.20 / $1.20；Fish s2.1-pro $15 / 百萬 UTF-8 bytes（free $0）；'
-        'Demucs 依 Replicate T4 GPU $0.000225 / 秒。實際以帳單為準。'
-    )
+    lines.extend(_used_rate_footer(last_entries))
     return '\n'.join(lines)
 
 

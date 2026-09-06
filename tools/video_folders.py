@@ -3,7 +3,7 @@ import os
 
 import gradio as gr
 
-_SKIP_FOLDER_NAMES = {'_demucs_chunks', 'wavs', 'SPEAKER', '__pycache__'}
+_SKIP_FOLDER_NAMES = {'_demucs_chunks', 'wavs', 'SPEAKER', '__pycache__', 'translations'}
 
 
 def list_video_folders():
@@ -22,16 +22,23 @@ def list_video_folders():
 
 def refresh_folder_dropdown(current):
     folders = list_video_folders()
-    value = current if current in folders else 'videos'
+    current = os.path.normpath(current) if current else ''
+    value = current if current in folders else ('videos' if 'videos' in folders else (folders[0] if folders else 'videos'))
     if value not in folders:
-        folders.insert(0, value)
+        value = folders[0] if folders else 'videos'
     return gr.update(choices=folders, value=value)
 
 
 def folder_dropdown(label='影片輸出資料夾'):
     folders = list_video_folders()
     value = 'videos' if 'videos' in folders else (folders[0] if folders else 'videos')
-    return gr.Dropdown(choices=folders, value=value, label=label)
+    return gr.Dropdown(
+        choices=folders,
+        value=value,
+        label=label,
+        allow_custom_value=False,
+        filterable=False,
+    )
 
 
 def folder_picker(label='影片輸出資料夾'):
