@@ -376,3 +376,162 @@ def test_cancellation_does_not_poison_next_job():
     check_stop()
     next_job = start_job()
     finish_job(next_job)
+
+
+def test_exhausted_keys_are_not_recycled(monkeypatch):
+    from tools import api_keys
+    monkeypatch.setattr(api_keys, '_DEAD', {})
+    monkeypatch.setattr(api_keys, '_COUNTERS', {})
+    monkeypatch.setenv('TEST_DUB_KEY', 'first-secret, second-secret')
+    api_keys.mark_api_key_dead('first-secret')
+    assert api_keys.next_api_key('TEST_DUB_KEY', expand=False)[0] == 'second-secret'
+    api_keys.mark_api_key_dead('second-secret')
+    with pytest.raises(RuntimeError, match='均已停用'):
+        api_keys.next_api_key('TEST_DUB_KEY', expand=False)
+
+
+def test_usage_accounts_include_empty_response_before_fallback(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tools import translation_openai as mod
+    calls = []
+    monkeypatch.setenv('OPENAI_API_KEY', 'private-main-key')
+    monkeypatch.setenv('OPENAI_USE_RESPONSES', '1')
+    first = NS(output_text='', output=[], usage=NS(input_tokens=10, output_tokens=20))
+    second = NS(choices=[NS(message=NS(content='Hello'))], usage=NS(prompt_tokens=5, completion_tokens=3))
+    client = NS(responses=NS(create=lambda **kw: first),
+                chat=NS(completions=NS(create=lambda **kw: second)))
+    monkeypatch.setattr(mod, 'OpenAI', lambda **kw: client)
+    monkeypatch.setattr('tools.cost_tracker.record', lambda *args, **kw: calls.append(kw))
+    assert mod._call_openai('private-main-key', 1, 1, [], reasoning_effort='off') == 'Hello'
+    assert [c['response'] for c in calls] == [first, second]
+    assert all(c['credential'] == 'OPENAI_API_KEY' for c in calls)
+    assert 'private-main-key' not in repr(calls)
+
+
+def test_timeout_does_not_start_second_generation_protocol(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tools import translation_openai as mod
+    def fail(**kwargs):
+        raise TimeoutError('response timed out after submission')
+    chat = []
+    monkeypatch.setenv('OPENAI_USE_RESPONSES', '1')
+    client = NS(responses=NS(create=fail), chat=NS(completions=NS(create=lambda **kw: chat.append(kw))))
+    monkeypatch.setattr(mod, 'OpenAI', lambda **kw: client)
+    with pytest.raises(TimeoutError):
+        mod._call_openai('test-key', 1, 1, [])
+    assert chat == []
+
+
+def test_account_usage_sums_input_output_without_double_counting_reasoning():
+    from tools.cost_tracker import credential_token_lines
+    lines = credential_token_lines([
+        {'provider':'openai', 'credential':'OPENAI_API_KEY', 'input_tokens':100,
+         'output_tokens':50, 'reasoning_tokens':40},
+        {'provider':'openai', 'credential':'OPENAI_API_KEY', 'input_tokens':20, 'output_tokens':10},
+        {'provider':'openai', 'credential':'OPENAI_TRANSLATE_API_KEY', 'input_tokens':7, 'output_tokens':3},
+        {'provider':'fish', 'characters':500},
+    ])
+    assert '- OPENAI_API_KEY：180' in lines
+    assert '- OPENAI_TRANSLATE_API_KEY：10' in lines
+
+
+def test_replicate_respects_proxy_and_no_proxy(monkeypatch):
+    from tools.demucs import _replicate_client
+    monkeypatch.setenv('REPLICATE_API_TOKEN', 'test-token')
+    monkeypatch.setenv('REPLICATE_BASE_URL', 'https://api.replicate.com')
+    monkeypatch.setattr('urllib.request.getproxies', lambda: {'https':'http://proxy.test:8080'})
+    monkeypatch.setattr('urllib.request.proxy_bypass', lambda host: False)
+    monkeypatch.setattr('replicate.Client', lambda **kwargs: kwargs)
+    assert _replicate_client()['proxy'] == 'http://proxy.test:8080'
+    monkeypatch.setattr('urllib.request.proxy_bypass', lambda host: True)
+    assert 'proxy' not in _replicate_client()
+
+
+def test_voice_sample_download_does_not_forward_api_secret(monkeypatch, tmp_path):
+    from types import SimpleNamespace as NS
+    from tools import fish_voice_match as mod
+    requests = []
+    def get(url, **kwargs):
+        requests.append((url, kwargs))
+        if len(requests) == 1:
+            return NS(status_code=200, json=lambda: {'samples':[{'audio':'https://media.example.test/voice.wav'}]})
+        return NS(status_code=200, content=b'a'*4096, headers={})
+    monkeypatch.setattr(mod, '_CACHE_DIR', str(tmp_path))
+    monkeypatch.setattr(mod, '_auth_headers', lambda: {'Authorization':'Bearer private-fish-key'})
+    monkeypatch.setattr(mod.requests, 'get', get)
+    monkeypatch.setattr(mod, '_load_mono', lambda path: (np.ones(20), SR))
+    monkeypatch.setattr('tools.utils.save_wav_norm', lambda *args, **kwargs: None)
+    assert mod._download_sample('voice-id')
+    assert requests[0][1]['headers']['Authorization'] == 'Bearer private-fish-key'
+    assert 'headers' not in requests[1][1]
+
+
+def test_mfcc_voice_cache_is_reused_without_rebuilding(monkeypatch, tmp_path):
+    from tools import fish_voice_match as mod
+    expected = np.array([.2,.3,.4])
+    np.save(tmp_path/'cached-voice.npy', expected)
+    (tmp_path/'meta.json').write_text(json.dumps({'kind':'mfcc'}))
+    monkeypatch.setattr(mod, '_CACHE_DIR', str(tmp_path))
+    monkeypatch.setattr(mod, '_ge2e_encoder_model', lambda: None)
+    def unexpected(*args, **kwargs):
+        pytest.fail('A valid MFCC cache should not download or synthesize audio')
+    monkeypatch.setattr(mod, '_download_sample', unexpected)
+    result=mod.ensure_stock_prints([{'id':'cached-voice'}], tts_fn=unexpected)
+    np.testing.assert_array_equal(result['cached-voice'], expected)
+
+
+def test_shortening_keeps_source_and_stops_on_no_safe_rewrite(monkeypatch):
+    from tools import translation as mod
+    source='我答应过要帮忙，但是我不能继续留下来。'
+    current="I promised I'd help, but I can't stay."
+    messages=[]
+    def respond(method, incoming):
+        messages.append(incoming)
+        return current
+    monkeypatch.setattr(mod, '_llm_translate', respond)
+    result, prompt=mod._shorten_one(line(0, 1, source, current), 'English', 'OpenAI', [])
+    assert result == current
+    assert len(messages) == 1
+    assert source in messages[0][-1]['content']
+
+
+def test_dialogue_quote_punctuation_survives_cleanup():
+    from tools.translation_quality import translation_postprocess
+    text='You wrote “the center of the universe.”'
+    assert translation_postprocess(text, 'English') == text
+    assert translation_postprocess('“Wait, I am not done.”', 'English') == 'Wait, I am not done.'
+    assert translation_postprocess("'Tis a strange day.", 'English') == "'Tis a strange day."
+
+
+def test_usage_receipts_survive_without_finishing_session(tmp_path):
+    from tools.cost_tracker import CostSession
+    session=CostSession(str(tmp_path))
+    try:
+        session.add('openai','translate','gpt-5.6-luna',credential='OPENAI_TRANSLATE_API_KEY',input_tokens=100,output_tokens=40)
+        session.add('openai','review','gpt-5.6-sol',credential='OPENAI_API_KEY',input_tokens=80,output_tokens=30)
+        receipts=[json.loads(row) for row in (tmp_path/'api_usage.jsonl').read_text().splitlines()]
+        assert [r['input_tokens']+r['output_tokens'] for r in receipts] == [140,110]
+        assert all(r['run_id']==session.run_id for r in receipts)
+        assert not (tmp_path/'cost.json').exists()
+    finally:
+        session.stop_ticker()
+
+
+def test_sentence_initial_contraction_is_not_a_protected_character_name():
+    from tools.translation_quality import suggest_wrecks_voice
+    assert not suggest_wrecks_voice('你不是说三分钟送到吗？',
+        "Didn't you promise delivery in three minutes?", 'You promised three minutes?', 'English')
+
+
+def test_repeated_invalid_shortening_stops_without_five_paid_attempts(monkeypatch):
+    from tools import translation as mod
+    calls=[]
+    current='I need you to stay and help me finish this.'
+    def respond(*args, **kwargs):
+        calls.append(1)
+        return 'Go!'
+    monkeypatch.setattr(mod, '_llm_translate', respond)
+    monkeypatch.setattr(mod.time, 'sleep', lambda *a: None)
+    result,_=mod._shorten_one(line(0,1,'我需要你留下来帮我做完这件事。',current),'English','OpenAI',[])
+    assert result == current
+    assert len(calls) == 2

@@ -143,7 +143,10 @@ def _transcribe_file(wav_path, asr_model, language=None):
                         create_kwargs['timestamp_granularities'] = ['segment']
                     result = client.audio.transcriptions.create(**create_kwargs)
                 from tools.cost_tracker import record
-                record('openai', 'asr', asr_model, response=result, seconds=getattr(result, 'duration', None))
+                from tools.api_keys import openai_key_label
+                record('openai', 'asr', asr_model, response=result,
+                       seconds=getattr(result, 'duration', None),
+                       credential=openai_key_label(api_key))
                 last_exc = None
                 break
             except Exception as exc:

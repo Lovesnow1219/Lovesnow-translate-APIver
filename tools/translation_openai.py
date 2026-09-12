@@ -20,7 +20,8 @@ def _extract_output_text(response):
 
 
 def _call_openai(api_key, n_keys, index, messages, reasoning_effort=None, timeout=None, model=None, purpose='translate'):
-    from tools.api_keys import is_quota_error
+    from tools.api_keys import is_quota_error, openai_key_label
+    from tools.cost_tracker import record
 
     model_name = (model or os.getenv('MODEL_NAME') or 'gpt-5.6-luna').strip()
     base_url = os.getenv('OPENAI_API_BASE') or 'https://api.openai.com/v1'
@@ -52,14 +53,17 @@ def _call_openai(api_key, n_keys, index, messages, reasoning_effort=None, timeou
             kwargs['reasoning'] = {'effort': effort}
         try:
             response = client.responses.create(**kwargs)
+            # Even an empty / reasoning-only response may consume tokens.
+            record('openai', kind, model_name, response=response,
+                   credential=openai_key_label(api_key))
             text = _extract_output_text(response)
             if text:
-                from tools.cost_tracker import record
-                record('openai', kind, model_name, response=response)
                 return text
             logger.warning('Responses API 沒有回文字，改走 Chat Completions')
         except Exception as exc:
-            if is_quota_error(exc):
+            # A timeout can occur after generation was billed. Only fall back
+            # when the endpoint explicitly reports protocol incompatibility.
+            if is_quota_error(exc) or getattr(exc, 'status_code', None) not in (400, 404, 405, 422, 501):
                 raise
             logger.warning(f'Responses API 失敗，改走 Chat Completions: {exc}')
 
@@ -76,8 +80,8 @@ def _call_openai(api_key, n_keys, index, messages, reasoning_effort=None, timeou
     if extra_body:
         kwargs['extra_body'] = extra_body
     response = client.chat.completions.create(**kwargs)
-    from tools.cost_tracker import record
-    record('openai', kind, model_name, response=response)
+    record('openai', kind, model_name, response=response,
+           credential=openai_key_label(api_key))
     return response.choices[0].message.content
 
 

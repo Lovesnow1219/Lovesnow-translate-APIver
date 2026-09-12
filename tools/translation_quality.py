@@ -298,23 +298,6 @@ _QUESTION_VERB_EN = re.compile(
 )
 _AIR_NEG_SRC = re.compile(r'空气中没|空氣中沒|空气中沒|空氣中没|[中里裡]没有|[中里裡]沒有')
 _PLACE_EN = re.compile(r'\b(in the air|in the wind|around here|here)\b', re.I)
-_SPEAR_CHAR = re.compile(r'[枪槍]')
-_MODERN_GUN_SRC = re.compile(
-    r'手枪|手槍|开枪|開槍|子弹|子彈|枪械|槍械|步枪|步槍|'
-    r'火枪|火槍|鸟枪|鳥槍|猎枪|獵槍|机枪|機槍|烟枪|煙槍|'
-    r'枪决|槍決|枪毙|槍斃|枪击|槍擊|水枪|水槍'
-)
-_GUN_EN = re.compile(r'\bguns?\b', re.I)
-_REALM_RIVER_SRC = re.compile(
-    r'(?:寻常|尋常|平常|普通)?河道\s*[巔巅]?峰|'
-    r'河道\s*(?:强者|期|境|大成)|'
-    r'(?:寻常|尋常|平常|普通)河道'
-)
-_CHANNEL_EN = re.compile(r'\b(channels?|waterways?|rivers?)\b', re.I)
-_TITLED_HERO_SRC = re.compile(r'[称稱][\u4e00-\u9fff]{2,8}俊[傑杰]')
-_GENERIC_HERO_NAMES = {'hero', 'heroes', 'heaven', 'earth', 'unashamed'}
-
-
 def _drops_question_verb(src, dub):
     if not _source_asks(src) or not _EXPERIENCE_VERB_RE.search(src or ''):
         return False
@@ -331,39 +314,6 @@ def _drops_location_negation(src, dub):
     if re.match(r'^no\b', first, re.I) and not re.search(r'\b(in|here|around)\b', first, re.I):
         return bool(re.search(r'空气|空氣|这里|這裡', src or ''))
     return False
-
-
-def _spear_as_gun(src, dub):
-    if _MODERN_GUN_SRC.search(src or '') or not _GUN_EN.search(dub or ''):
-        return False
-    return bool(_SPEAR_CHAR.search(src or ''))
-
-
-def _realm_as_waterway(src, dub):
-    if not _REALM_RIVER_SRC.search(src or ''):
-        return False
-    return bool(_CHANNEL_EN.search(dub or ''))
-
-
-def _drops_heaven_earth(src, dub):
-    if '天地' not in (src or ''):
-        return False
-    spoken = dub or ''
-    if not re.search(r'\bheavens?\b', spoken, re.I):
-        return False
-    return not bool(re.search(r'\bearth\b', spoken, re.I))
-
-
-def _crushes_titled_hero(src, dub):
-    if not _TITLED_HERO_SRC.search(src or ''):
-        return False
-    spoken = (dub or '').strip()
-    if not re.match(r'^\s*(?:an? |the )?hero(?:es)?\b', spoken, re.I):
-        return False
-    if re.search(r'\bhero(?:es)?\s+(of|from|in)\b', spoken, re.I):
-        return False
-    leftover = set(_name_tokens(spoken)) - _GENERIC_HERO_NAMES
-    return not leftover
 
 
 def sense_issue(src, dub):
@@ -432,10 +382,9 @@ def suggest_wrecks_voice(source, current, suggest, target_language='English'):
         return True
     old_names = set(_name_tokens(old))
     sug_names = set(_name_tokens(sug))
-    if old_names and not (old_names & sug_names) and src_chars >= 4:
-        return True
-    if len(old_names) >= 2 and len(old_names & sug_names) < 2 and src_chars >= 6:
-        return True
+    # Capitalization alone cannot establish a proper name (e.g. sentence-start
+    # verbs and contractions). The episode glossary and contextual reviewer
+    # protect real names; do not reject ordinary rewrites using this heuristic.
     if not _source_stammer_flip(src):
         clauses = _cjk_clause_count(src)
         if clauses >= 3 and len(sug_words) < clauses + 1:
@@ -567,7 +516,11 @@ def translation_postprocess(result, target_language='简体中文'):
     result = (result or '').strip()
     if not is_chinese_target(target_language):
         result = re.sub(r'^(Translated text:\s*|Translation:\s*|译文[：:]\s*|翻译[：:]\s*)', '', result, flags=re.I)
-        result = result.strip().strip('"“”\'')
+        result = result.strip()
+        for left, right in (('"', '"'), ('“', '”'), ("'", "'"), ('‘', '’')):
+            if len(result) >= 2 and result.startswith(left) and result.endswith(right):
+                result = result[1:-1].strip()
+                break
         result = re.sub(r'\[[^\]]+\]', '', result)
         result = re.sub(r'\s*\n+\s*', ' ', result)
         return result.strip()
@@ -732,16 +685,10 @@ def _incomplete_reason(text, cleaned, target_language, duration):
             'Copy the source as-is. Do not rewrite recognized English or Latin. '
             'Output only the line.'
         )
-    if _speaks_both_mouths(text, cleaned):
-        return (
-            'This card has two speakers. Translate only the first speaker. '
-            "Do not speak the other mouth's command. Output only the line."
-        )
     if _sense_broken(text, cleaned):
         return (
-            'Keep the verb, the place, and the real weapon or realm word. '
-            'Do not telegraph. A spear is not a gun. A cultivation realm is not a river. '
-            'Heaven and Earth stay together. A titled hero keeps the place name. '
+            'Preserve the complete meaning, grammatical relationships, and relevant place. '
+            'Use the current episode context to resolve ambiguous words. '
             'Output only the line.'
         )
     if _source_ellipsis(text) or _source_stammer_flip(text):
@@ -866,15 +813,12 @@ def _translate_user_content(text, duration, target_language, budget_scale=1.0, e
             )
         if lang == 'English':
             return (
-                f'{note}Translate the whole line into spoken English in {duration:.1f}s, '
-                f'max {budget} words. Fish TTS is slow; do not overflow the slot. '
-                f'Use the outline names. Keep meaning, emotion, and 啊吧呢呀嗯呵哼. '
-                f'If the Chinese is angry, scared, or mocking, do not sound polite. '
-                f'If the Chinese trails off with ……, keep the named thing and trail off; '
-                f'do not add somehow or finish the thought. '
-                f'If this card glued two speakers, translate only the first mouth. '
-                f'If the line is already Latin letters or kana, copy it; do not clean it. '
-                f'Do not add names that are not in this line. Do not chop into fragments:"{text}"'
+                f'{note}Translate the whole line into spoken English for a {duration:.1f}s slot, '
+                f'aiming for about {budget} words. Keep natural grammar and the complete meaning. '
+                'Use the scene and speaker context to preserve the intent and any joke. '
+                'Prefer everyday conversational phrasing unless the source is deliberately formal. '
+                'Do not drop a clause to meet the estimate; a slightly longer natural line is preferable. '
+                f'Output only the dubbed line:"{text}"'
             )
         return f'{note}Translate in {duration:.1f}s, max {budget} {lang} words:"{text}"'
     if uses_char_budget(target_language):
@@ -958,4 +902,3 @@ def split_sentences(translation, use_char_based_end=True, target_language='Engli
             line['orig_end'] = line.get('end')
         output_data.append(line)
     return output_data
-

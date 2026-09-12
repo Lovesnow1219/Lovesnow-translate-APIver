@@ -239,8 +239,7 @@ def _shorten_one(line, target_language, method, fixed_message, budget_scale=0.85
                 ' Cut filler only. Keep the speech-act, addressee, and names. '
                 + review_rewrite_rules(target_language) +
                 ' If the Chinese trails off, keep the named thing and the ellipsis. '
-                ' Do not add somehow. Do not speak a second mouth. '
-                ' Keep the verb in a question. A spear is not a gun. '
+                ' Preserve every source clause and keep questions grammatical. '
                 ' Broken English is worse than being slightly long. Speak numbers.'
             )
         elif lang == 'Vietnamese':
@@ -249,7 +248,9 @@ def _shorten_one(line, target_language, method, fixed_message, budget_scale=0.85
             extra = ''
         user_content = (
             f'Shorten this dubbed line so it can be spoken in {duration:.1f}s, max {budget} {lang} {unit}. '
-            f'Keep names and meaning.{extra} Output only the shortened line:"{current}"'
+            f'Keep names and meaning.{extra} Source line:"{source}". '
+            f'Current dub:"{current}". If no natural faithful shorter line exists, '
+            'return the current dub unchanged. Output only the dubbed line.'
         )
     elif uses_char_budget(target_language):
         budget = max(4, int(round(_spoken_char_budget(duration, target_language) * budget_scale)))
@@ -259,12 +260,14 @@ def _shorten_one(line, target_language, method, fixed_message, budget_scale=0.85
         )
         user_content = (
             f'Shorten this dubbed line so it can be spoken in {duration:.1f}s, max {budget} {lang} characters. '
-            f'Keep names and meaning.{extra} Output only the shortened line:"{current}"'
+            f'Keep names and meaning.{extra} Source line:"{source}". '
+            f'Current dub:"{current}". Output only the shortened line.'
         )
     else:
         return current, ''
     retry_message = 'Only output the shortened line.'
     last_model_output = ''
+    seen_candidates = set()
     for retry in range(5):
         messages = fixed_message + [{'role': 'user', 'content': user_content}]
         if retry and retry_message:
@@ -276,6 +279,12 @@ def _shorten_one(line, target_language, method, fixed_message, budget_scale=0.85
             last_model_output = (response or '').replace('\n', ' ').strip()
             logger.info(f'原譯：{current}')
             logger.info(f'收緊：{last_model_output}')
+            if last_model_output == current:
+                return current, user_content
+            if last_model_output in seen_candidates:
+                logger.info('縮句重複回覆同一候選，保留原譯並交由審稿檢查')
+                return current, user_content
+            seen_candidates.add(last_model_output)
             success, cleaned = valid_translation(
                 source, last_model_output, target_language, duration=duration,
             )

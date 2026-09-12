@@ -116,9 +116,20 @@ DEMUCS_CHANNELS = 2
 
 def _replicate_client():
     import replicate
+    from urllib.parse import urlsplit
+    from urllib.request import getproxies, proxy_bypass
 
     timeout = httpx.Timeout(connect=60.0, read=900.0, write=900.0, pool=60.0)
-    return replicate.Client(api_token=_token(), timeout=timeout)
+    # replicate 1.x supplies its own HTTPX transport, which disables HTTPX's
+    # automatic environment proxy discovery. Keep the user's proxy / NO_PROXY
+    # settings effective without changing TLS verification.
+    endpoint = urlsplit(os.getenv('REPLICATE_BASE_URL') or 'https://api.replicate.com')
+    proxies = getproxies()
+    proxy = proxies.get(endpoint.scheme) or proxies.get('all')
+    options = {}
+    if proxy and endpoint.hostname and not proxy_bypass(endpoint.hostname):
+        options['proxy'] = proxy
+    return replicate.Client(api_token=_token(), timeout=timeout, **options)
 
 
 def _is_transient(exc):
@@ -218,7 +229,6 @@ def _separate_one(audio_path, vocal_output_path, instruments_output_path, model_
                 tmp_wavs.append(tmp)
         if not _mix_wavs(tmp_wavs, instruments_output_path):
             raise RuntimeError('混合伴奏失敗')
-        tmp_wavs = []
     finally:
         for path in tmp_wavs:
             if os.path.exists(path):
