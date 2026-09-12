@@ -131,3 +131,13 @@ Each episode lives in `videos/<title>/`. Plot notes stay in that folder’s `sou
 ## License
 
 See `NOTICE`. This tree is the cloud-API fork of Lovesnow-translate.
+
+## Stable delivery and timeline diagnostics
+
+The UI separates **fixed TTS delivery speed** (default 1.00), **English translation word budget** (default 2.2 words/sec), and **whole-video playback speed**. Sentence length no longer silently changes the requested TTS speed. Long dialogue remains complete; only conservative near-silent edges are removed.
+
+Use the per-episode creative brief and editable `prompts/dubbing_style.md` for tone. Translation receives neighboring source dialogue even in parallel mode. Ambiguous meanings and character decisions should follow the current episode, not a global genre-specific replacement list.
+
+The timeline tab shows each line's original and actual start, duration, and delay. Changing the brief or word budget affects new translations; select force retranslate to update existing text. Legacy WAVs without cache fingerprints are regenerated on the first upgraded dubbing run and may incur API charges. Later runs reuse validated matching audio.
+
+See the [review and validation notes](docs/dubbing-review-2026-09.md), including the remaining live-provider and visual UI validation gaps. Run offline regression tests with `pip install -r requirements-dev.txt` and `python -m pytest -q tests` (FFmpeg and ffprobe required).

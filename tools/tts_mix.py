@@ -258,6 +258,7 @@ def stamp_orig_times(transcript):
     for line in transcript or []:
         if line.get('orig_start') is None:
             line['orig_start'] = float(line.get('start') or 0)
+        if line.get('orig_end') is None:
             line['orig_end'] = float(line.get('end') or 0)
     return transcript
 
@@ -277,7 +278,7 @@ def _fade_to_seconds(wav, sample_rate, cap, fade=0.08):
     return out
 
 
-def fit_tts_to_gap(wav_path, max_length, sample_rate=24000, particle=False):
+def fit_tts_to_gap(wav_path, max_length, sample_rate=24000, particle=False, diagnostics=None):
     """Keep a full spoken sentence. Particles may fade; dialogue never slices.
 
     Dialogue overrun delays the next line. A 嘿嘿/呵/哼 card that is much longer
@@ -288,7 +289,12 @@ def fit_tts_to_gap(wav_path, max_length, sample_rate=24000, particle=False):
     except Exception:
         alt = wav_path.replace('.wav', '.mp3') if wav_path.endswith('.wav') else wav_path + '.mp3'
         wav, sample_rate = librosa.load(alt, sr=sample_rate, mono=True)
-    current = len(wav) / sample_rate if sample_rate else 0.0
+    from tools.dubbing_timing import trim_edge_silence
+    raw_seconds = len(wav) / sample_rate
+    wav = trim_edge_silence(wav, sample_rate)
+    current = len(wav) / sample_rate
+    if diagnostics is not None:
+        diagnostics.update(raw_seconds=raw_seconds, trimmed_seconds=raw_seconds - current)
     if current <= 0:
         return np.zeros((int(0.05 * sample_rate),), dtype=np.float32), 0.05
     wav = np.asarray(wav, dtype=np.float32)
@@ -305,47 +311,67 @@ def fit_tts_to_gap(wav_path, max_length, sample_rate=24000, particle=False):
 
 
 def assemble_dub_timeline(transcript, wav_paths, sample_rate=24000, vocals=None):
-    from tools.vocal_particles import (
-        available_tts_seconds,
-        is_inner_overlapping_particle,
-        is_particle_card,
-    )
+    from tools.vocal_particles import available_tts_seconds, is_inner_overlapping_particle, is_particle_card
+    from tools.line_roles import should_skip_dub
+    from tools.target_language import is_asr_junk
+    from tools.job_control import check_stop
 
+    wav_paths = list(wav_paths)
+    if len(transcript) != len(wav_paths):
+        raise ValueError('對白與配音音檔數量不一致')
+    if sample_rate <= 0:
+        raise ValueError('音訊取樣率須大於零')
     stamp_orig_times(transcript)
     starts = [_orig_start(line) for line in transcript]
-    full = np.zeros((0,), dtype=np.float32)
+    if any(not np.isfinite(start) or start < 0 for start in starts):
+        raise ValueError('原片開始時間必須是非負有限數字')
+    if any(a > b for a, b in zip(starts, starts[1:])):
+        raise ValueError('原片對白時間順序錯誤，請先修正字幕時間軸')
+    # Append chunks once. Repeatedly concatenating the entire film is quadratic.
+    chunks, cursor = [], 0
     vocals = None if vocals is None else np.asarray(vocals, dtype=np.float32).reshape(-1)
     for i, (line, wav_path) in enumerate(zip(transcript, wav_paths)):
-        start = starts[i]
-        if is_inner_overlapping_particle(transcript, i):
-            logger.warning(
-                f'跳過重疊語氣詞以免壓扁原句：{(line.get("text") or "")[:8]}@{start:.2f}s'
-            )
-            line['start'] = start
-            line['end'] = start
+        check_stop()
+        orig_start = starts[i]
+        orig_end = float(line['orig_end'])
+        if not np.isfinite(orig_end) or orig_end < orig_start:
+            raise ValueError(f'第 {i} 句的原片結束時間無效')
+        skip = (should_skip_dub(line) or is_asr_junk(line.get('text'))
+                or is_inner_overlapping_particle(transcript, i))
+        if skip:
+            # Silent placeholders must not push dialogue later by 80 ms each.
+            line['start'] = line['end'] = orig_start
+            line['dub_timing'] = dict(orig_start=orig_start, start=orig_start,
+                slot_seconds=orig_end-orig_start, duration_seconds=0.0,
+                delay_seconds=0.0, trimmed_seconds=0.0, skipped=True)
             continue
-        last_end = len(full) / sample_rate
-        if start < last_end - 0.02:
-            start = last_end
+        start_sample = max(cursor, round(orig_start * sample_rate))
+        start = start_sample / sample_rate
         max_len = available_tts_seconds(transcript, i, start)
-        if start > last_end:
-            pad = int(round((start - last_end) * sample_rate))
-            if pad > 0:
-                full = np.concatenate((full, np.zeros((pad,), dtype=np.float32)))
-        wav, length = fit_tts_to_gap(
-            wav_path, max_len, sample_rate,
-            particle=is_particle_card(line.get('text')),
-        )
-        orig_start = float(line.get('orig_start') or start)
-        orig_end = float(line.get('orig_end') or (orig_start + length))
+        diagnostics = {}
+        wav, length = fit_tts_to_gap(wav_path, max_len, sample_rate,
+            particle=is_particle_card(line.get('text')), diagnostics=diagnostics)
+        if not wav.size or not np.any(wav):
+            line['start'] = line['end'] = orig_start
+            line['dub_timing'] = dict(orig_start=orig_start, start=orig_start,
+                slot_seconds=orig_end-orig_start, duration_seconds=0.0,
+                delay_seconds=0.0, trimmed_seconds=0.0, skipped=True)
+            continue
+        if start_sample > cursor:
+            chunks.append(np.zeros(start_sample - cursor, dtype=np.float32))
         orig_slice = None
         if vocals is not None and vocals.size:
-            orig_slice = vocals[int(orig_start * sample_rate):int(orig_end * sample_rate)]
+            orig_slice = vocals[round(orig_start * sample_rate):round(orig_end * sample_rate)]
         wav = match_line_loudness(wav, orig_slice)
-        line['start'] = len(full) / sample_rate
-        full = np.concatenate((full, wav))
-        line['end'] = line['start'] + length
-    return limit_peak(full)
+        chunks.append(wav)
+        cursor = start_sample + len(wav)
+        line['start'] = start
+        line['end'] = cursor / sample_rate
+        line['dub_timing'] = dict(
+            orig_start=orig_start, start=start, slot_seconds=orig_end-orig_start,
+            duration_seconds=len(wav)/sample_rate, delay_seconds=max(0.0, start-orig_start),
+            skipped=False, **diagnostics)
+    return limit_peak(np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32))
 
 
 def _load_vocals(folder, sample_rate=24000):
@@ -379,6 +405,8 @@ def restitch_tts_timeline(folder, target_language='中文'):
                 return False
         wav_paths.append(path)
     full_wav = assemble_dub_timeline(transcript, wav_paths, vocals=_load_vocals(folder))
+    from tools.dubbing_timing import write_timing_report
+    write_timing_report(folder, transcript)
     save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'))
     with open(transcript_path, 'w', encoding='utf-8') as handle:
         json.dump(transcript, handle, indent=2, ensure_ascii=False)

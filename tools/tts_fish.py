@@ -872,33 +872,46 @@ def voice_for_method(assignment, speaker, method='Fish', ui_voice=None):
 
 
 def _fix_wav_header(path):
-    """Fish often writes 0xFFFFFFFF chunk sizes; wave.getnframes then looks like hours."""
-    try:
-        with open(path, 'rb') as handle:
-            data = handle.read()
-        if len(data) < 44 or data[:4] != b'RIFF' or data[8:12] != b'WAVE':
-            return
-        size = len(data)
-        data_idx = data.find(b'data', 12)
-        if data_idx < 0:
-            return
-        riff_size = (size - 8).to_bytes(4, 'little')
-        payload = (size - data_idx - 8).to_bytes(4, 'little')
-        patched = bytearray(data)
-        patched[4:8] = riff_size
-        patched[data_idx + 4:data_idx + 8] = payload
-        if patched != data:
-            with open(path, 'wb') as handle:
-                handle.write(patched)
-    except Exception:
+    """Repair streaming RIFF lengths without treating metadata as PCM samples."""
+    with open(path, 'rb') as handle:
+        data = bytearray(handle.read())
+    if len(data) < 44 or data[:4] != b'RIFF' or data[8:12] != b'WAVE':
         return
+    size = len(data)
+    changed = False
+    riff_size = int.from_bytes(data[4:8], 'little')
+    if riff_size in (0, 0xFFFFFFFF):
+        data[4:8] = (size-8).to_bytes(4, 'little')
+        changed = True
+    offset = 12
+    while offset + 8 <= size:
+        chunk_id = data[offset:offset+4]
+        length = int.from_bytes(data[offset+4:offset+8], 'little')
+        if chunk_id == b'data':
+            if length in (0, 0xFFFFFFFF):
+                data[offset+4:offset+8] = (size-offset-8).to_bytes(4, 'little')
+                changed = True
+            break
+        if length > size-offset-8:
+            return
+        offset += 8 + length + (length % 2)
+    if changed:
+        with open(path, 'wb') as handle:
+            handle.write(data)
+
+
+def _valid_tts_wav(path):
+    import soundfile as sf
+    try:
+        samples, rate = sf.read(path, dtype='float32')
+        return (rate > 0 and len(samples) >= rate * 0.04
+                and np.isfinite(samples).all() and np.max(np.abs(samples)) > 0.0001)
+    except (OSError, ValueError, RuntimeError):
+        return False
 
 
 def tts(text, output_path, target_language='中文', voice=None, speed=1.0):
     global _use_paid_model
-    if os.path.exists(output_path):
-        logger.info(f'TTS {text} 已存在')
-        return
     from tools.api_keys import next_api_key
     url = os.getenv('FISH_API_URL', 'https://api.fish.audio/v1/tts')
     model = FISH_TTS_PAID if _use_paid_model else FISH_TTS_FREE
@@ -908,8 +921,26 @@ def tts(text, output_path, target_language='中文', voice=None, speed=1.0):
         reference_id = voice
     elif env_voice:
         reference_id = env_voice
+    from tools.dubbing_settings import fingerprint, read_json, write_json_atomic, file_identity
+    from tools.target_language import tts_language
+    requested_speed = float(speed)
+    if not np.isfinite(requested_speed) or not 0.5 <= requested_speed <= 2.0:
+        raise ValueError('Fish speed must be between 0.5 and 2.0')
+    request_id = fingerprint({
+        'version': 1, 'text': text, 'language': tts_language(target_language),
+        'voice': reference_id, 'speed': requested_speed, 'endpoint': url,
+        'models': [FISH_TTS_FREE, FISH_TTS_PAID],
+        'temperature': delivery_temperature(text, japanese=tts_language(target_language) == 'Japanese'),
+    })
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     wav_path = output_path if output_path.endswith('.wav') else output_path.replace('.mp3', '.wav')
+    cache_path = wav_path + '.json'
+    cached = read_json(cache_path, {})
+    if (isinstance(cached, dict) and cached.get('request') == request_id
+            and cached.get('audio') == file_identity(wav_path)
+            and _valid_tts_wav(wav_path)):
+        logger.info(f'TTS 快取有效: {os.path.basename(wav_path)}')
+        return
     last_error = None
     delays = (0.0, 1.0, 2.0, 4.0, 8.0)
     from tools.job_control import check_stop
@@ -931,7 +962,7 @@ def tts(text, output_path, target_language='中文', voice=None, speed=1.0):
             'latency': 'normal',
             'temperature': delivery_temperature(text, japanese=japanese),
             'top_p': 0.8,
-            'prosody': {'speed': float(min(2.0, max(0.5, speed or 1.0))), 'volume': 0, 'normalize_loudness': True},
+            'prosody': {'speed': requested_speed, 'volume': 0, 'normalize_loudness': True},
         }
         if japanese:
             payload['language'] = 'ja'
@@ -949,9 +980,21 @@ def tts(text, output_path, target_language='中文', voice=None, speed=1.0):
                 timeout=120,
             )
             if response.status_code == 200 and response.content:
-                with open(wav_path, 'wb') as f:
-                    f.write(response.content)
-                _fix_wav_header(wav_path)
+                fd, temporary = tempfile.mkstemp(
+                    dir=os.path.dirname(wav_path) or '.', suffix='.wav')
+                try:
+                    with os.fdopen(fd, 'wb') as handle:
+                        handle.write(response.content)
+                    _fix_wav_header(temporary)
+                    if not _valid_tts_wav(temporary):
+                        raise ValueError('Fish 回傳的 WAV 無效或沒有語音')
+                    check_stop()
+                    os.replace(temporary, wav_path)
+                    write_json_atomic(cache_path, {
+                        'request': request_id, 'audio': file_identity(wav_path), 'model': model})
+                finally:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
                 from tools.cost_tracker import record
                 spoken = spoken_text_for_timing(text)
                 record('fish', 'tts_fish', model, utf8_bytes=len(spoken.encode('utf-8')), characters=len(spoken))

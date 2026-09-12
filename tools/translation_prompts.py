@@ -5,34 +5,17 @@ import os
 from tools.target_language import is_chinese_target, translation_language
 from tools.translation_bible import bible_context
 
-_HOUSE_RULE_PATH = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), '..', '.cursor', 'rules', 'dubbing-pipeline.mdc',
-))
-
-
-def _house_section(raw, title):
-    token = f'## {title}'
-    if token not in raw:
-        return ''
-    body = raw.split(token, 1)[1]
-    if '\n## ' in body:
-        body = body.split('\n## ', 1)[0]
-    bullets = []
-    for line in body.splitlines():
-        text = line.strip()
-        if text.startswith('- '):
-            bullets.append(text[2:])
-    return ' '.join(bullets)
+_STYLE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'prompts', 'dubbing_style.md'))
 
 
 def _house_review_rules():
-    """Same 時軸／譯文節奏 bullets the desktop agent sees."""
+    """Load an editable creative brief, never agent rules or prior-episode fixes."""
     try:
-        raw = open(_HOUSE_RULE_PATH, encoding='utf-8').read()
+        with open(_STYLE_PATH, encoding='utf-8') as handle:
+            return handle.read().strip()
     except OSError:
         return ''
-    parts = [_house_section(raw, title) for title in ('時軸', '譯文節奏')]
-    return ' '.join(part for part in parts if part)
+
 
 DUBBING_SHOTS = {
     'English': (
@@ -51,7 +34,6 @@ DUBBING_SHOTS = {
         ('Translate the whole line into spoken English in 2.0s, max 6 words:"好啊，那我就告诉你们吧。卫兵，上！"', "Fine, I'll tell you."),
         ('Translate the whole line into spoken English in 1.2s, max 4 words:"是、是……不！"', 'Y-yes... no!'),
         ('Translate the whole line into spoken English in 1.8s, max 6 words:"老头，你去过那里吗？"', 'Geezer, you been there?'),
-        ('Translate the whole line into spoken English in 1.5s, max 6 words:"你拿枪指着我？"', "You're pointing that spear at me?"),
         ('Translate the whole line into spoken English in 1.8s, max 7 words:"空气中没有灵气。"', 'No spiritual energy in the air.'),
         ('Translate the whole line into spoken English in 2.0s, max 12 words:"称此地俊杰无愧于天地。"', 'Hero of this land, unashamed before Heaven and Earth!'),
     ),
@@ -152,14 +134,9 @@ def dubbing_fixed_message(summary, target_language='简体中文'):
             'Keep technique and chant names; never join two mouths with " / ". '
             'Unfinished …… stays unfinished: keep the named array or art and trail off. '
             'Do not add somehow/anyway or close a guessed sentence. '
-            'If one card glued two speakers (a reply then someone else\'s command), '
-            'translate only the first mouth. '
             'If the line is already Latin letters or kana, copy it; do not clean it into proper English. '
             'Keep the verb in a question (seen/been/gone). Do not telegraph "X\'s depths?" '
-            'A polearm 枪 is a spear, not a gun, unless the Chinese is a firearm. '
-            'If ASR wrote 河道 next to 巔峰/强者, that is a realm, not a river. '
             'Heaven and Earth stay together; do not keep only Heaven. '
-            '称〇俊傑 keeps the place; do not crush it to Hero. '
             'Do not stamp a glossary name onto a 3–8 character ASR hash that is not that name. '
             'Do not output a one-word bark unless the Chinese is also a bark. '
             'A slightly long line is better than broken English. '
@@ -216,7 +193,7 @@ def review_rewrite_rules(target_language='English'):
     lang = translation_language(target_language)
     house = _house_review_rules()
     prefix = (
-        f'Operator house rules (follow these; they are not optional): {house} '
+        f'General dubbing guidance (adapt to this episode): {house} '
         if house else ''
     )
     return prefix + (
@@ -234,10 +211,8 @@ def review_rewrite_rules(target_language='English'):
         'If a card glued two speakers, translate only the first mouth; leave suggest empty if you cannot split. '
         'Unfinished …… stays unfinished: keep the named thing and trail off. No somehow/anyway. '
         'A yes-then-no stammer (是……不) stays a stammer. Do not turn it into Fine, I\'ll tell you. '
-        'Keep the verb in a question. A polearm 枪 is a spear, not a gun. '
         'A cultivation-realm homophone is not a river or channel. '
         '「空氣中沒有…」keeps the place (in the air / here). '
-        '天地 is Heaven and Earth. 称〇俊傑 keeps the place name. '
         'If a Chinese episode line was recognized as English/Latin/kana, copy it. '
         'Do not clean it into proper English and do not invent another language. '
         'Empty 呸/高/嗯 on real speech get a short vocalization, not a blank. '
@@ -264,7 +239,6 @@ def review_editor_brief(target_language='English'):
         'do not telegraph a question by dropping the verb; '
         'polearm 枪 is spear, not gun; 河道巔峰/强者 is a realm homophone, not a waterway; '
         '「空氣中沒有…」must keep the place; 天地 is Heaven and Earth; '
-        '称〇俊傑 keeps the place — do not crush it to Hero; '
         'do not stamp a glossary name onto ASR hash that is not that name; '
         'school, class, place, and title names stay intelligible — do not invent opaque number-codes; '
         'technique or chant names (·, 剑/诀/阵, or three-plus clauses) must keep the distinctive parts; '

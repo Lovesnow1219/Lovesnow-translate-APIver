@@ -232,7 +232,7 @@ def load_dub_meta(folder):
 
 
 AUDIO_MIX_VERSION = 7
-AUDIO_LAYOUT_VERSION = 5
+AUDIO_LAYOUT_VERSION = 6
 TRANSLATION_VERSION = 7
 LANGUAGE_TRANSLATION_VERSION = {
     'English': 11,
@@ -559,11 +559,13 @@ def speakers_are_locked(folder):
     return bool(load_dub_meta(folder).get('speakers_locked'))
 
 
-def tts_cache_ok(folder, target_language):
+def tts_cache_ok(folder, target_language, voice=None):
     import os
     if not os.path.isfile(os.path.join(folder, 'audio_combined.wav')):
         return False
     if not translation_cache_ok(folder, target_language):
         return False
     cached = load_dub_meta(folder).get('tts')
-    return _same_lang(cached, target_language, 'tts')
+    from tools.dubbing_settings import render_is_current
+    return (_same_lang(cached, target_language, 'tts')
+            and render_is_current(folder, target_language, voice))

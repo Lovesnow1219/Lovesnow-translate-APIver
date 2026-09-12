@@ -88,6 +88,8 @@ def _filter_glossary_names(glossary):
 def bible_context(summary):
     summary = summary or {}
     parts = []
+    if summary.get('dubbing_style'):
+        parts.append('Creative brief for this episode: ' + str(summary['dubbing_style']))
     title = (summary.get('title') or '').strip()
     plot = (summary.get('summary') or '').strip()
     if title:
@@ -329,6 +331,8 @@ def ensure_episode_bible(folder, info, transcript, target_language, method='Open
                 summary = loaded
         except Exception:
             summary = {}
+    from tools.dubbing_settings import style_note
+    summary['dubbing_style'] = style_note(folder)
     if _summary_has_bible(summary, target_language):
         return summary
     try:
@@ -360,6 +364,7 @@ def ensure_episode_bible(folder, info, transcript, target_language, method='Open
         return summary
     built = summarize(info, transcript, target_language, method)
     if built:
+        built['dubbing_style'] = style_note(folder)
         with open(summary_path, 'w', encoding='utf-8') as handle:
             json.dump(built, handle, indent=2, ensure_ascii=False)
     return built

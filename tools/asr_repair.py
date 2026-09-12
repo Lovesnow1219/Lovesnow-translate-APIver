@@ -27,14 +27,6 @@ _MAX_NEW_SPEAKERS = 4
 _HAN_RE = re.compile(r'[\u4e00-\u9fff]')
 _HAN_KEEP = re.compile(r'[^\w\u4e00-\u9fff]+', flags=re.UNICODE)
 _SPEAKER_ID_RE = re.compile(r'^SPEAKER_[A-Z][A-Z0-9]{0,3}$')
-_REALM_RIVER_FIXES = (
-    (re.compile(r'(寻常|尋常|平常|普通)河道'), r'\1合道'),
-    (re.compile(r'河道(?=\s*[巔巅]?峰)'), '合道'),
-    (re.compile(r'河道(?=\s*强者)'), '合道'),
-    (re.compile(r'河道(?=\s*期)'), '合道'),
-    (re.compile(r'河道(?=\s*境)'), '合道'),
-    (re.compile(r'河道(?=\s*大成)'), '合道'),
-)
 
 
 def repair_path(folder):
@@ -72,19 +64,7 @@ def ensure_repaired_transcript(folder, transcript=None, method='OpenAI', progres
     if not isinstance(transcript, list) or not transcript:
         return transcript
     if not force and already_repaired(folder):
-        from tools.line_roles import reassign_addressed_you_lines
-        moved = reassign_addressed_you_lines(transcript)
-        homophones = apply_realm_homophone_fixes(transcript)
-        if moved or homophones:
-            os.makedirs(folder, exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as handle:
-                json.dump(transcript, handle, indent=4, ensure_ascii=False)
-            if moved:
-                logger.info(f'語意講者規則改了 {moved} 句：{folder}')
-            if homophones:
-                logger.info(f'境界近音河道改回合道 {homophones} 句：{folder}')
-        else:
-            logger.info(f'辨識後修稿已做過，略過：{folder}')
+        logger.info(f'辨識後修稿已做過，略過：{folder}')
         return transcript
     return repair_asr_script(
         folder, transcript, method=method, progress_callback=progress_callback,
@@ -202,11 +182,12 @@ def _progress(progress_callback, message):
 
 
 def fix_realm_homophones(text):
-    """合道 heard as 河道 next to a realm word is a realm, not a river."""
-    out = text or ''
-    for pattern, repl in _REALM_RIVER_FIXES:
-        out = pattern.sub(repl, out)
-    return out
+    """Compatibility helper: ambiguity belongs to context-aware ASR review.
+
+    A word such as 河道 may be a real river. Never silently rewrite it from
+    a cultivation-specific word list shared by every episode.
+    """
+    return text or ''
 
 
 def apply_realm_homophone_fixes(transcript):
@@ -508,7 +489,7 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         'You repair Chinese ASR subtitle cards before they are translated. '
         'You have an episode outline written from these cards. '
         'Fix misheard words when the outline and nearby cards make the intended word clear. '
-        'Cultivation realm homophones (合道 heard as 河道) go back to the realm word, not a river. '
+        'Resolve homophones only when the current episode context supports the correction; otherwise preserve the source. '
         'Join consecutive SAME-speaker cards that are one spoken sentence. '
         'Set skip=true only for sung lyrics or unintelligible noise. Leave those cards empty. '
         'Keep speech that sits in the music bed: opening TV, livestream ads, recap, narrator. '
@@ -611,9 +592,5 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         )
         moved_n += audit_n
     except Exception as exc:
-        if isinstance(exc, JobStopped):
-            raise
         logger.warning(f'講者語意覆核失敗，沿用分批修稿：{exc}')
-    from tools.line_roles import reassign_addressed_you_lines
-    moved_n += reassign_addressed_you_lines(transcript)
     return changed, skip_n, merge_n, moved_n, created, transcript

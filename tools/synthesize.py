@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
+import math
+import tempfile
 import os
 import re
 import shutil
@@ -244,13 +246,8 @@ def convert_resolution(aspect_ratio, resolution='1080p'):
 
 
 def _srt_copy_for_ffmpeg(srt_path):
-    temp_dir = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'Temp', 'lovesnow-translate')
-    try:
-        os.makedirs(temp_dir, exist_ok=True)
-    except OSError:
-        temp_dir = 'temp'
-        os.makedirs(temp_dir, exist_ok=True)
-    dest = os.path.join(temp_dir, f'sub_{os.getpid()}.srt')
+    fd, dest = tempfile.mkstemp(prefix='lovesnow-sub-', suffix='.srt')
+    os.close(fd)
     shutil.copyfile(srt_path, dest)
     return dest
 
@@ -268,37 +265,31 @@ def _ffmpeg_output_path(command):
 
 
 def _output_is_complete(path, duration):
-    if not path or not os.path.exists(path):
+    if not path or not os.path.isfile(path) or os.path.getsize(path) <= 0:
         return False
     try:
-        if os.path.getsize(path) < 10000:
-            return False
-    except OSError:
-        return False
-    if not duration or duration <= 1:
+        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries',
+            'stream=codec_type,duration', '-of', 'json', path],
+            capture_output=True, text=True, check=True, timeout=30)
+        streams = json.loads(result.stdout).get('streams', [])
+        for kind in ('video', 'audio'):
+            values = [float(item.get('duration', 0)) for item in streams if item.get('codec_type') == kind]
+            if not values or not math.isfinite(max(values)) or max(values) <= 0:
+                return False
+            if duration and abs(max(values) - duration) > 0.25:
+                return False
         return True
-    try:
-        from tools.audio_chunks import media_duration
-        got = media_duration(path)
-    except Exception:
-        return False
-    return got >= float(duration) * 0.97
-
-
-def _newer(path, than):
-    try:
-        return os.path.isfile(path) and os.path.getmtime(path) > os.path.getmtime(than) + 1
-    except OSError:
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
 
 
-def _mux_is_current(folder, final_video, duration):
-    if not _output_is_complete(final_video, duration):
-        return False
-    for name in ('audio_combined.wav', 'translation.json', 'download.mp4'):
-        if _newer(os.path.join(folder, name), final_video):
-            return False
-    return True
+def _mux_is_current(folder, final_video, duration, signature=None):
+    from tools.dubbing_settings import read_json, file_identity
+    stamp = read_json(final_video + '.json', {})
+    return (isinstance(stamp, dict) and signature is not None
+            and stamp.get('signature') == signature
+            and stamp.get('output') == file_identity(final_video)
+            and _output_is_complete(final_video, duration))
 
 
 def _swap_output_path(command, new_path):
@@ -316,13 +307,6 @@ def _finish_mux_file(tmp_path, final_path, duration):
     if tmp_path and os.path.isfile(tmp_path) and _output_is_complete(tmp_path, duration):
         os.replace(tmp_path, final_path)
         return True
-    if _output_is_complete(final_path, duration):
-        if tmp_path and os.path.isfile(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        return True
     return False
 
 
@@ -338,15 +322,20 @@ def _run_ffmpeg(command, what='FFmpeg', duration=None):
     if cmd and str(cmd[0]).lower().endswith('ffmpeg'):
         cmd[1:1] = ['-nostdin', '-loglevel', 'error', '-progress', 'pipe:1', '-nostats', '-hide_banner']
     logger.info(f'{what}: {" ".join(str(x) for x in cmd)}')
-    # Never pipe stderr: libass subtitle logs fill the Windows 64KB pipe and deadlock ffmpeg.
+    # A file avoids a full stderr pipe deadlock and keeps the actual error.
+    error_log = tempfile.TemporaryFile()
     popen_kw = dict(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=error_log,
     )
     if os.name == 'nt':
         popen_kw['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-    proc = subprocess.Popen(cmd, **popen_kw)
+    try:
+        proc = subprocess.Popen(cmd, **popen_kw)
+    except BaseException:
+        error_log.close()
+        raise
     lines = Queue()
 
     def _read_stdout():
@@ -417,11 +406,16 @@ def _run_ffmpeg(command, what='FFmpeg', duration=None):
     except JobStopped:
         if proc.poll() is None:
             proc.kill()
+        proc.wait()
+        error_log.close()
+        if tmp_path and os.path.isfile(tmp_path):
+            os.remove(tmp_path)
         raise
+    error_log.seek(0, os.SEEK_END)
+    error_log.seek(max(0, error_log.tell() - 4000))
+    error_detail = error_log.read().decode('utf-8', 'replace').strip()
+    error_log.close()
     if code == 0 and _finish_mux_file(tmp_path, final_path, duration or 0):
-        return True
-    if _finish_mux_file(tmp_path, final_path, duration):
-        logger.warning(f'{what} 行程異常結束，但輸出檔已完整，視為成功: {final_path}')
         return True
     if tmp_path and os.path.isfile(tmp_path):
         try:
@@ -431,7 +425,7 @@ def _run_ffmpeg(command, what='FFmpeg', duration=None):
     if stalled:
         logger.error(f'{what} 卡住後輸出不完整')
         return False
-    logger.error(f'{what} 失敗')
+    logger.error(f'{what} 失敗 (exit {code}): {error_detail}')
     return False
 
 
@@ -462,145 +456,99 @@ def _publish_named_video(folder, video_path):
 
 
 def synthesize_video(folder, subtitles=True, speed_up=1.00, fps=30, resolution='1080p', background_music=None, watermark_path=None, bgm_volume=0.5, video_volume=1.0):
+    from tools.audio_chunks import media_duration
+    from tools.dubbing_settings import fingerprint, file_identity, write_json_atomic
+    from tools.target_language import titled_video_path
+
+    speed_up = float(speed_up)
+    fps = float(fps)
+    if not math.isfinite(speed_up) or not 0.5 <= speed_up <= 2.0:
+        raise ValueError('整片播放倍率須介於 0.5–2.0 倍')
+    if not math.isfinite(fps) or not 1 <= fps <= 60 or not fps.is_integer():
+        raise ValueError('幀率須為 1–60 的整數')
+    for label, value in [('背景音樂音量', bgm_volume), ('配音與原伴奏音量', video_volume)]:
+        if not math.isfinite(float(value)) or not 0 <= float(value) <= 1:
+            raise ValueError(f'{label}須介於 0–1')
     translation_path = os.path.join(folder, 'translation.json')
     input_audio = os.path.join(folder, 'audio_combined.wav')
     input_video = os.path.join(folder, 'download.mp4')
-    
-    if not os.path.exists(translation_path) or not os.path.exists(input_audio):
-        return
-    
-    with open(translation_path, 'r', encoding='utf-8') as f:
-        translation = json.load(f)
-
-    srt_path = os.path.join(folder, 'subtitles.srt')
-    from tools.target_language import titled_video_path
+    for path in (translation_path, input_audio, input_video):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'合成缺少檔案：{path}')
+    with open(translation_path, encoding='utf-8') as handle:
+        translation = json.load(handle)
+    duration, audio_duration = media_duration(input_video), media_duration(input_audio)
+    if not all(math.isfinite(value) and value > 0 for value in (duration, audio_duration)):
+        raise ValueError('無法取得有效的影音時長')
+    # Extend in source time FIRST, then scale video, speech and subtitle times.
+    source_duration = max(duration, audio_duration)
+    mux_duration = source_duration / speed_up
+    signature = fingerprint({
+        'version': 2, 'subtitles': bool(subtitles), 'speed': speed_up, 'fps': fps,
+        'resolution': resolution, 'bgm_volume': bgm_volume, 'video_volume': video_volume,
+        'files': [file_identity(path) for path in
+                  (input_video, input_audio, translation_path, background_music, watermark_path)],
+    })
     final_video = titled_video_path(folder)
-    duration = None
-    try:
-        from tools.audio_chunks import media_duration
-        duration = media_duration(input_video)
-    except Exception:
-        duration = None
-    if subtitles and _mux_is_current(folder, final_video, duration):
-        logger.info(f'影片已合成且音訊未更新，跳過重燒: {final_video}')
+    if _mux_is_current(folder, final_video, mux_duration, signature):
+        logger.info(f'影音與輸出設定相同，沿用成片: {final_video}')
         return _publish_named_video(folder, final_video)
+    srt_path = os.path.join(folder, 'subtitles.srt')
     generate_srt(translation, srt_path, speed_up, folder=folder)
-    aspect_ratio = get_aspect_ratio(input_video)
-    width, height = convert_resolution(aspect_ratio, resolution)
-    font_size = int(width / 128)
-    outline = int(round(font_size / 8))
-    speed_up = float(speed_up or 1.0)
-    need_speed = abs(speed_up - 1.0) > 0.001
+    width, height = convert_resolution(get_aspect_ratio(input_video), resolution)
+    # libass scales its default 384x288 script canvas to the output resolution.
+    font_size = 18
+    outline = 1
     srt_temp = None
     started = time.time()
-
     try:
-        video_steps = []
-        if need_speed:
-            video_steps.append(f'setpts=PTS/{speed_up}')
-        video_steps.append(f'scale={width}:{height}')
-        video_steps.append(f'fps={int(fps)}')
-        mux_duration = duration
-        try:
-            from tools.audio_chunks import media_duration as _media_duration
-            audio_duration = _media_duration(input_audio)
-        except Exception:
-            audio_duration = None
-        extra = 0.0
-        if duration and audio_duration and audio_duration > duration + 0.08:
-            extra = float(audio_duration - duration)
-            mux_duration = float(audio_duration)
-            video_steps.append(f'tpad=stop_mode=clone:stop_duration={extra:.3f}')
-
+        video_steps = ['setpts=PTS-STARTPTS']
+        if audio_duration > duration:
+            video_steps.append(f'tpad=stop_mode=clone:stop_duration={audio_duration-duration:.6f}')
+        video_steps.extend([f'setpts=PTS/{speed_up}', f'scale={width}:{height}', f'fps={int(fps)}'])
         inputs = ['-i', input_video, '-i', input_audio]
-        next_idx = 2
-        wm_idx = None
-        bgm_idx = None
+        wm_idx = bgm_idx = None
         if watermark_path:
-            inputs += ['-i', watermark_path]
-            wm_idx = next_idx
-            next_idx += 1
+            wm_idx = 2
+            inputs += ['-i', os.fspath(watermark_path)]
         if background_music:
-            inputs += ['-i', background_music]
-            bgm_idx = next_idx
-
-        video_out = '[v]' if not subtitles and wm_idx is None else '[v0]'
-        graph = [f"[0:v]{','.join(video_steps)}{video_out}"]
-        vlabel = video_out
+            bgm_idx = 3 if wm_idx is not None else 2
+            inputs += ['-i', os.fspath(background_music)]
+        graph = [f"[0:v]{','.join(video_steps)}[picture]"]
+        vlabel = '[picture]'
         if wm_idx is not None:
-            video_out = '[v]' if not subtitles else '[v1]'
-            graph.append(f'[{wm_idx}:v]scale=iw*0.15:ih*0.15[wm]')
-            graph.append(f'{vlabel}[wm]overlay=W-w-10:H-h-10{video_out}')
-            vlabel = video_out
-
+            graph.extend([f'[{wm_idx}:v]scale=iw*0.15:ih*0.15[wm]',
+                          f'{vlabel}[wm]overlay=W-w-10:H-h-10[marked]'])
+            vlabel = '[marked]'
         if subtitles:
             srt_temp = _srt_copy_for_ffmpeg(srt_path)
-            srt_escaped = _escape_ffmpeg_subtitles_path(srt_temp)
-            style = (
-                f"FontName=Arial,FontSize={font_size},PrimaryColour=&HFFFFFF,"
-                f"OutlineColour=&H000000,Outline={outline},WrapStyle=2"
-            )
-            graph.append(f"{vlabel}subtitles={srt_escaped}:force_style='{style}'[v]")
-
-        audio_map = '1:a'
-        if need_speed and bgm_idx is not None:
-            graph.append(f'[1:a]atempo={speed_up},volume={video_volume}[va]')
-            graph.append(f'[{bgm_idx}:a]volume={bgm_volume}[ba]')
-            graph.append('[va][ba]amix=inputs=2:duration=first[a]')
-            audio_map = '[a]'
-        elif need_speed:
-            graph.append(f'[1:a]atempo={speed_up}[a]')
-            audio_map = '[a]'
-        elif bgm_idx is not None:
-            graph.append(f'[1:a]volume={video_volume}[va]')
-            graph.append(f'[{bgm_idx}:a]volume={bgm_volume}[ba]')
-            graph.append('[va][ba]amix=inputs=2:duration=first[a]')
-            audio_map = '[a]'
-
-        command = [
-            'ffmpeg', '-y', '-threads', '0',
-            *inputs,
-            '-filter_complex', ';'.join(graph),
-            '-map', '[v]',
-            '-map', audio_map,
-            *_video_encoder_args(),
-            '-c:a', 'aac', '-b:a', '192k',
-            final_video,
-        ]
-        if mux_duration and mux_duration > 1:
-            command[-1:-1] = ['-t', f'{mux_duration:.3f}']
-            logger.info(f'開始合成影片，片長約 {mux_duration:.0f} 秒')
-            from tools.cost_tracker import mark_stage
-            mark_stage(f'影片合成中 0/{mux_duration:.0f} 秒', 90)
-        ok = _run_ffmpeg(command, '一次合成影片', duration=mux_duration)
-        if not ok and subtitles:
-            logger.warning('含字幕一次合成失敗，改為先無字幕再燒字幕')
-            plain = synthesize_video(
-                folder, subtitles=False, speed_up=speed_up, fps=fps, resolution=resolution,
-                background_music=background_music, watermark_path=watermark_path,
-                bgm_volume=bgm_volume, video_volume=video_volume,
-            )
-            if not plain or not os.path.exists(plain):
-                return None
-            subtitled = final_video.replace('.mp4', '_subtitles.mp4')
-            burned = add_subtitles(plain, srt_path, subtitled, method='ffmpeg')
-            if burned and os.path.exists(subtitled):
-                os.replace(subtitled, final_video)
-            else:
-                logger.warning('字幕燒錄失敗，保留無字幕配音影片')
-        elif not ok:
-            return None
-        if not os.path.exists(final_video):
-            logger.error(f'合成影片未生成: {final_video}')
-            return None
-        logger.info(f'影片合成完成，用時 {time.time() - started:.1f}s: {final_video}')
+            style = (f'FontName=Arial,FontSize={font_size},PrimaryColour=&HFFFFFF,'
+                     f'OutlineColour=&H000000,Outline={outline},WrapStyle=2')
+            graph.append(f"{vlabel}subtitles={_escape_ffmpeg_subtitles_path(srt_temp)}:force_style='{style}'[v]")
+        else:
+            graph.append(f'{vlabel}null[v]')
+        # Volume must work with or without extra BGM. Pad short audio rather
+        # than ending the film early; never trim the original spoken tail.
+        graph.append(f'[1:a]asetpts=PTS-STARTPTS,atempo={speed_up},'
+                     f'volume={float(video_volume)},apad=whole_dur={mux_duration:.6f}[speech]')
+        if bgm_idx is not None:
+            graph.extend([f'[{bgm_idx}:a]asetpts=PTS-STARTPTS,volume={float(bgm_volume)}[bed]',
+                          '[speech][bed]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.99:latency=1[a]'])
+        else:
+            graph.append('[speech]anull[a]')
+        command = ['ffmpeg', '-y', '-threads', '0', *inputs,
+                   '-filter_complex', ';'.join(graph), '-map', '[v]', '-map', '[a]',
+                   *_video_encoder_args(), '-c:a', 'aac', '-b:a', '192k',
+                   '-t', f'{mux_duration:.6f}', final_video]
+        if not _run_ffmpeg(command, '合成影片', duration=mux_duration):
+            raise RuntimeError('影片合成失敗，舊成片已保留。請查看 FFmpeg 錯誤訊息。')
+        write_json_atomic(final_video + '.json', {
+            'signature': signature, 'output': file_identity(final_video)})
+        logger.info(f'影片合成完成，用時 {time.time()-started:.1f}s: {final_video}')
         return _publish_named_video(folder, final_video)
     finally:
         if srt_temp and os.path.exists(srt_temp):
-            try:
-                os.remove(srt_temp)
-            except OSError:
-                pass
+            os.remove(srt_temp)
 
 
 def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, method='ffmpeg'):
@@ -761,7 +709,7 @@ def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, metho
                     logger.debug(f"无法删除临时文件 {temp_file}: {e}")
 
 def synthesize_all_video_under_folder(folder, subtitles=True, speed_up=1.00, fps=30, resolution='1080p', background_music=None, bgm_volume=0.5, video_volume=1.0, watermark_path="f_logo.png"):
-    watermark_path = None if not os.path.exists(watermark_path) else watermark_path
+    watermark_path = watermark_path if watermark_path and os.path.isfile(watermark_path) else None
     output_video = None
     for root, dirs, files in os.walk(folder):
         if 'download.mp4' in files:

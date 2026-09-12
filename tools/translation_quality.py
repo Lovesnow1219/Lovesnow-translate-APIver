@@ -372,14 +372,6 @@ def sense_issue(src, dub):
         return '問句被收成電報，動詞沒了'
     if _drops_location_negation(src, dub):
         return '否定句丟了處所'
-    if _spear_as_gun(src, dub):
-        return '冷兵器的槍被譯成 gun'
-    if _realm_as_waterway(src, dub):
-        return '境界近音被譯成河道'
-    if _drops_heaven_earth(src, dub):
-        return '天地被收成只有 Heaven'
-    if _crushes_titled_hero(src, dub):
-        return '稱〇俊傑被收成 Hero'
     return ''
 
 

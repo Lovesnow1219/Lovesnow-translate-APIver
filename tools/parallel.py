@@ -41,9 +41,9 @@ def map_parallel(fn, items, workers=4):
             if is_stopped():
                 for pending in futures:
                     pending.cancel()
-                pool.shutdown(wait=False, cancel_futures=True)
+                pool.shutdown(wait=True, cancel_futures=True)
                 check_stop()
             results[futures[future]] = future.result()
         return results
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        pool.shutdown(wait=True, cancel_futures=True)

@@ -1711,15 +1711,15 @@ def review_after_dub(folder, language=None, method='OpenAI', progress_callback=N
     return report
 
 
-def _after_dub_fingerprint(transcript):
-    import hashlib
-
+def _after_dub_fingerprint(transcript, folder=None):
+    from tools.dubbing_settings import fingerprint, file_identity
     parts = []
     for i, line in enumerate(transcript or []):
-        parts.append(
-            f"{i}\t{line.get('speaker') or ''}\t{(line.get('translation') or '').strip()}"
-        )
-    return hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest()[:16]
+        parts.append({key: line.get(key) for key in (
+            'speaker', 'text', 'translation', 'orig_start', 'orig_end', 'start', 'end')})
+        if folder:
+            parts[-1]['wav'] = file_identity(os.path.join(folder, 'wavs', f'{i:04d}.wav'))
+    return fingerprint(parts)
 
 
 def _after_dub_stamp_lang(folder, language):
@@ -1737,7 +1737,7 @@ def after_dub_already_done(folder, language=None):
     if not transcript:
         return False
     stamps = load_dub_meta(folder).get('after_dub') or {}
-    return str(stamps.get(lang) or '') == _after_dub_fingerprint(transcript)
+    return str(stamps.get(lang) or '') == _after_dub_fingerprint(transcript, folder)
 
 
 def stamp_after_dub(folder, language=None):
@@ -1751,7 +1751,7 @@ def stamp_after_dub(folder, language=None):
     path = os.path.join(folder, 'dub_meta.json')
     meta = load_dub_meta(folder)
     stamps = dict(meta.get('after_dub') or {})
-    stamps[lang] = _after_dub_fingerprint(transcript)
+    stamps[lang] = _after_dub_fingerprint(transcript, folder)
     meta['after_dub'] = stamps
     os.makedirs(folder, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as handle:
