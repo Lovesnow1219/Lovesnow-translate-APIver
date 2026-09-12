@@ -382,6 +382,7 @@ def clear_asr_downstream(folder, keep_bible=True):
     _remove_path(os.path.join(folder, 'transcript.json'))
     _remove_path(os.path.join(folder, 'asr_review.json'))
     _remove_path(os.path.join(folder, 'asr_repair.json'))
+    _remove_path(os.path.join(folder, 'source_subtitle_review.json'))
     _remove_path(os.path.join(folder, 'source_bible.json'))
     _remove_path(os.path.join(folder, 'translations'))
     clear_translation_cache(folder, keep_bible=keep_bible)

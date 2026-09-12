@@ -38,6 +38,9 @@ def source_bible_path(folder):
 
 
 def already_repaired(folder):
+    from tools.source_subtitles import pending
+    if pending(folder):
+        return False
     path = repair_path(folder)
     if not os.path.isfile(path):
         return False
@@ -79,6 +82,8 @@ def repair_asr_script(folder, transcript, method='OpenAI', progress_callback=Non
     lines = [dict(item) for item in (transcript or [])]
     if not lines:
         return lines
+    from tools.source_subtitles import review_source_subtitles
+    lines = review_source_subtitles(folder, lines)
     from tools.line_roles import promote_bgm_speech
     rescued = promote_bgm_speech(lines)
     if rescued:
@@ -155,6 +160,8 @@ def ensure_source_bible(folder, transcript, method='OpenAI'):
     from tools.translation_bible import _load_folder_info, build_dubbing_bible
 
     info = _load_folder_info(folder)
+    from tools.dubbing_settings import style_note
+    info['dubbing_style'] = style_note(folder)
     bible = build_dubbing_bible(info, transcript, '简体中文', method)
     if not bible:
         return {}
@@ -339,6 +346,8 @@ def _format_card(index, line):
         f'#{index} {line.get("speaker") or ""} '
         f'{_card_t0(line):.2f}-{_card_t1(line):.2f} | '
         f'{(line.get("text") or "").strip()}'
+        + (f' | Visible source captions: {json.dumps(line["source_subtitle_evidence"], ensure_ascii=False)}'
+           if line.get('source_subtitle_evidence') else '')
     )
 
 
@@ -480,6 +489,7 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
     from tools.translation_backends import llm_translate
     from tools.translation_bible import bible_context
     from tools.translation_review import _join_lines, _merge_span
+    from tools.source_subtitles import preserves_caption_terms
 
     context = _context_blob(bible, transcript)
     outline = bible_context(bible) or '(no outline yet)'
@@ -488,6 +498,9 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
     system = (
         'You repair Chinese ASR subtitle cards before they are translated. '
         'You have an episode outline written from these cards. '
+        'That outline is provisional and is NOT independent evidence for uncertain words. '
+        'Visible source captions, when provided, are direct evidence from this video. '
+        'Preserve their spelling and facts over guesses in the ASR-derived outline. '
         'Fix misheard words when the outline and nearby cards make the intended word clear. '
         'Resolve homophones only when the current episode context supports the correction; otherwise preserve the source. '
         'Join consecutive SAME-speaker cards that are one spoken sentence. '
@@ -557,12 +570,17 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         if new_spk:
             moved_n += _apply_speaker_item(transcript, item, allowed_speakers, created)
         new_text = str(item.get('text') or item.get('suggest_source') or '').strip()
-        if new_text and _rewrite_ok(src, new_text, context, _duration(line)):
-            line['text'] = new_text
-            changed += 1
         span = _merge_span(item)
         if span:
+            # The proposed text covers the whole span. Apply it only together
+            # with a legal merge; otherwise the following card would be spoken
+            # twice while the host still has its original, shorter time slot.
             merges.append((span[0], span[1], new_text))
+            continue
+        if (new_text and preserves_caption_terms(line, new_text)
+                and _rewrite_ok(src, new_text, context, _duration(line))):
+            line['text'] = new_text
+            changed += 1
 
     blocked = set()
     deleted = []
@@ -574,11 +592,21 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         glued = transcript[host].get('text') or ''
         for index in absorbed:
             glued = _glue_source(glued, transcript[index].get('text') or '')
-        source = suggest_source if suggest_source and _rewrite_ok(glued, suggest_source, context, 99) else ''
+        members = [transcript[index] for index in [host, *absorbed]]
+        source = suggest_source if (suggest_source
+            and all(preserves_caption_terms(member, suggest_source) for member in members)
+            and _rewrite_ok(glued, suggest_source, context, 99)) else ''
+        evidence = list(dict.fromkeys(quote for member in members
+                                      for quote in member.get('source_subtitle_evidence', [])))
+        terms = list(dict.fromkeys(term for member in members
+                                   for term in member.get('source_subtitle_terms', [])))
         _join_lines(transcript, host, absorbed, '', source or None)
         if not source:
             transcript[host]['text'] = glued
         transcript[host].pop('translation', None)
+        if evidence:
+            transcript[host]['source_subtitle_evidence'] = evidence
+            transcript[host]['source_subtitle_terms'] = terms
         blocked.add(host)
         blocked.update(absorbed)
         deleted.extend(absorbed)

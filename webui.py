@@ -248,7 +248,7 @@ def do_everything_with_cost(
     root_folder, url, local_file, dl_res, shifts, source_lang, target_lang,
     translation_model, translation_effort, review_model, review_effort,
     subtitles, speed_up, fps, out_res, bgm, bgm_vol, video_vol,
-    words_per_sec, translate_workers, force_retranslate, tts_speed, style_note,
+    words_per_sec, translate_workers, force_retranslate, tts_speed, style_note, source_subtitles, subtitle_position,
 ):
     for status, video, cost_md in stream_do_everything(
         root_folder, url,
@@ -263,12 +263,24 @@ def do_everything_with_cost(
         review_model=review_model,
         review_effort=review_effort,
         source_language=source_lang, tts_speed=tts_speed, style_note=style_note,
+        source_subtitles=source_subtitles, subtitle_position=subtitle_position,
     ):
         yield status, (gr.update() if video is None else video), cost_md
 
 
 def demucs_from_ui(folder, progress, shifts):
     return separate_all_audio_under_folder(folder, model_name=DEMUCS_METHOD, progress=progress, shifts=shifts)
+
+
+def _subtitle_position():
+    return gr.Dropdown(choices=[('下方', 'bottom'), ('上方（避開原片底部字幕）', 'top')],
+                       value='bottom', label='翻譯字幕位置')
+
+
+def synthesize_from_ui(folder, subtitles, speed, fps, resolution, bgm, bgm_volume, video_volume, subtitle_position):
+    return synthesize_all_video_under_folder(folder, subtitles=subtitles, speed_up=speed,
+        fps=fps, resolution=resolution, background_music=bgm, bgm_volume=bgm_volume,
+        video_volume=video_volume, subtitle_position=subtitle_position)
 
 
 def asr_from_ui(folder, source_language):
@@ -787,6 +799,7 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
                 dl_res = _resolution('下載解析度')
                 out_res = _resolution('輸出解析度')
                 subtitles = gr.Checkbox(label='加入字幕', value=True)
+                subtitle_position = _subtitle_position()
                 speed_up = gr.Slider(minimum=0.5, maximum=2, step=0.05, label='整片播放倍率（畫面＋聲音）', value=1.00, info='通常維持 1.00；這會改變成片長度，與配音語速不同。')
                 fps = gr.Slider(minimum=1, maximum=60, step=1, label='幀率', value=30)
             bgm, bgm_vol, video_vol = _bgm_fields()
@@ -796,6 +809,8 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
                 info='清掉譯文後重翻。若大綱已鎖定會沿用大綱。',
             )
             with gr.Accordion('配音節奏', open=True):
+                source_subtitles = gr.Checkbox(label='以原片字幕為翻譯依據', value=False,
+                    info='適合有清晰字幕的改梗動畫：配音與字幕不同時，以字幕為準。使用主審核 API，最多取樣 48 張畫面；會增加用量，原文修改後會重建譯文與配音。')
                 tts_speed = _tts_speed()
                 style_note = gr.Textbox(label='本片翻譯風格／需求（可自由修改）', lines=3,
                     value='自然口語，保留吐槽、反轉、笑點與角色口吻。依本片情境處理梗和雙關，不擅自新增笑話或套用其他作品的設定。',
@@ -843,7 +858,7 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
             review_model, review_effort,
             subtitles, speed_up, fps, out_res,
             bgm, bgm_vol, video_vol,
-            words_per_sec, translate_workers, force_retranslate, tts_speed, style_note,
+            words_per_sec, translate_workers, force_retranslate, tts_speed, style_note, source_subtitles, subtitle_position,
         ],
         outputs=[status, result_video, cost_md],
     )
@@ -950,6 +965,7 @@ with gr.Blocks(theme=my_theme) as synthesize_video_interface:
             syn_folder = folder_picker('影片資料夾')
             with gr.Accordion('影片輸出', open=False):
                 syn_subtitles = gr.Checkbox(label='加入字幕', value=True)
+                syn_subtitle_position = _subtitle_position()
                 syn_speed = gr.Slider(minimum=0.5, maximum=2, step=0.05, label='整片播放倍率（畫面＋聲音）', value=1.00, info='通常維持 1.00；這會改變成片長度，與配音語速不同。')
                 syn_fps = gr.Slider(minimum=1, maximum=60, step=1, label='幀率', value=30)
                 syn_res = _resolution()
@@ -959,8 +975,8 @@ with gr.Blocks(theme=my_theme) as synthesize_video_interface:
             syn_status = gr.Text(label='合成狀態')
             syn_video = gr.Video(label='合成影片')
     syn_submit.click(
-        fn=synthesize_all_video_under_folder,
-        inputs=[syn_folder, syn_subtitles, syn_speed, syn_fps, syn_res, syn_bgm, syn_bgm_vol, syn_video_vol],
+        fn=synthesize_from_ui,
+        inputs=[syn_folder, syn_subtitles, syn_speed, syn_fps, syn_res, syn_bgm, syn_bgm_vol, syn_video_vol, syn_subtitle_position],
         outputs=[syn_status, syn_video],
     )
 

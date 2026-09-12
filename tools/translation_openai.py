@@ -19,6 +19,26 @@ def _extract_output_text(response):
     return ''
 
 
+def _chat_messages(messages):
+    """Preserve image inputs when using the Chat Completions compatibility path."""
+    result = []
+    for message in messages:
+        row = dict(message)
+        if isinstance(row.get('content'), list):
+            blocks = []
+            for part in row['content']:
+                if part.get('type') == 'input_text':
+                    blocks.append({'type': 'text', 'text': part['text']})
+                elif part.get('type') == 'input_image':
+                    blocks.append({'type': 'image_url', 'image_url': {
+                        'url': part['image_url'], 'detail': part.get('detail', 'auto')}})
+                else:
+                    blocks.append(part)
+            row['content'] = blocks
+        result.append(row)
+    return result
+
+
 def _call_openai(api_key, n_keys, index, messages, reasoning_effort=None, timeout=None, model=None, purpose='translate'):
     from tools.api_keys import is_quota_error, openai_key_label
     from tools.cost_tracker import record
@@ -69,7 +89,7 @@ def _call_openai(api_key, n_keys, index, messages, reasoning_effort=None, timeou
 
     kwargs = {
         'model': model_name,
-        'messages': messages,
+        'messages': _chat_messages(messages),
         'timeout': timeout,
     }
     extra_body = {}

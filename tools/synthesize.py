@@ -455,13 +455,15 @@ def _publish_named_video(folder, video_path):
     return dest if os.path.isfile(dest) else video_path
 
 
-def synthesize_video(folder, subtitles=True, speed_up=1.00, fps=30, resolution='1080p', background_music=None, watermark_path=None, bgm_volume=0.5, video_volume=1.0):
+def synthesize_video(folder, subtitles=True, speed_up=1.00, fps=30, resolution='1080p', background_music=None, watermark_path=None, bgm_volume=0.5, video_volume=1.0, subtitle_position='bottom'):
     from tools.audio_chunks import media_duration
     from tools.dubbing_settings import fingerprint, file_identity, write_json_atomic
     from tools.target_language import titled_video_path
 
     speed_up = float(speed_up)
     fps = float(fps)
+    if subtitle_position not in ('bottom', 'top'):
+        raise ValueError('字幕位置須為 top 或 bottom')
     if not math.isfinite(speed_up) or not 0.5 <= speed_up <= 2.0:
         raise ValueError('整片播放倍率須介於 0.5–2.0 倍')
     if not math.isfinite(fps) or not 1 <= fps <= 60 or not fps.is_integer():
@@ -484,7 +486,8 @@ def synthesize_video(folder, subtitles=True, speed_up=1.00, fps=30, resolution='
     source_duration = max(duration, audio_duration)
     mux_duration = source_duration / speed_up
     signature = fingerprint({
-        'version': 2, 'subtitles': bool(subtitles), 'speed': speed_up, 'fps': fps,
+        'version': 4, 'subtitles': bool(subtitles), 'subtitle_position': subtitle_position,
+        'speed': speed_up, 'fps': fps,
         'resolution': resolution, 'bgm_volume': bgm_volume, 'video_volume': video_volume,
         'files': [file_identity(path) for path in
                   (input_video, input_audio, translation_path, background_music, watermark_path)],
@@ -522,8 +525,10 @@ def synthesize_video(folder, subtitles=True, speed_up=1.00, fps=30, resolution='
             vlabel = '[marked]'
         if subtitles:
             srt_temp = _srt_copy_for_ffmpeg(srt_path)
+            # libass style overrides use SSA alignment values: 6 is top-center.
             style = (f'FontName=Arial,FontSize={font_size},PrimaryColour=&HFFFFFF,'
-                     f'OutlineColour=&H000000,Outline={outline},WrapStyle=2')
+                     f'OutlineColour=&H000000,Outline={outline},WrapStyle=2,'
+                     f'Alignment={6 if subtitle_position == "top" else 2},MarginV=12')
             graph.append(f"{vlabel}subtitles={_escape_ffmpeg_subtitles_path(srt_temp)}:force_style='{style}'[v]")
         else:
             graph.append(f'{vlabel}null[v]')
@@ -708,7 +713,7 @@ def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, metho
                 except Exception as e:
                     logger.debug(f"无法删除临时文件 {temp_file}: {e}")
 
-def synthesize_all_video_under_folder(folder, subtitles=True, speed_up=1.00, fps=30, resolution='1080p', background_music=None, bgm_volume=0.5, video_volume=1.0, watermark_path="f_logo.png"):
+def synthesize_all_video_under_folder(folder, subtitles=True, speed_up=1.00, fps=30, resolution='1080p', background_music=None, bgm_volume=0.5, video_volume=1.0, watermark_path="f_logo.png", subtitle_position='bottom'):
     watermark_path = watermark_path if watermark_path and os.path.isfile(watermark_path) else None
     output_video = None
     for root, dirs, files in os.walk(folder):
@@ -716,7 +721,8 @@ def synthesize_all_video_under_folder(folder, subtitles=True, speed_up=1.00, fps
             output_video = synthesize_video(root, subtitles=subtitles,
                             speed_up=speed_up, fps=fps, resolution=resolution,
                             background_music=background_music,
-                            watermark_path=watermark_path, bgm_volume=bgm_volume, video_volume=video_volume)
+                            watermark_path=watermark_path, bgm_volume=bgm_volume, video_volume=video_volume,
+                            subtitle_position=subtitle_position)
         # if 'download.mp4' in files and 'video.mp4' not in files:
         #     output_video = synthesize_video(root, subtitles=subtitles,
         #                      speed_up=speed_up, fps=fps, resolution=resolution,

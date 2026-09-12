@@ -261,6 +261,8 @@ def build_dubbing_bible(info, transcript, target_language, method='OpenAI'):
     user = (
         f'Title: "{info.get("title")}" Author: "{info.get("uploader")}".\n'
         f'{lock_note}'
+        f'Episode creative brief (tone and terminology, not permission to invent events): '
+        f'{(info or {}).get("dubbing_style") or "(none)"}\n'
         f'Dialogue (the only source of truth):\n{body}\n\n'
         f'Write a dubbing bible in {lang} as JSON only:\n'
         '{"title":"", "summary":"", "outline":"", "glossary":"", "voices":""}\n'
@@ -351,6 +353,7 @@ def ensure_episode_bible(folder, info, transcript, target_language, method='Open
         except Exception:
             pass
         info = dict(info or {})
+        info['dubbing_style'] = summary.get('dubbing_style') or ''
         info['source_glossary'] = info.get('source_glossary') or _locked_source_glossary(folder)
         bible = build_dubbing_bible(info, transcript, target_language, method)
         if bible:
@@ -459,4 +462,3 @@ def summarize(info, transcript, target_language='简体中文', method='LLM'):
         except Exception as e:
             logger.warning(f'总结翻译失败\n{e}')
             time.sleep(1)
-

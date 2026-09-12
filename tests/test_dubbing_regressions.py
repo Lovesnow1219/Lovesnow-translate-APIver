@@ -113,6 +113,9 @@ def test_mux_cache_reuses_identical_settings_and_rebuilds_changes(movie):
     identity = file_identity(result)
     assert synthesize_video(str(movie), subtitles=True, resolution='144p') == result
     assert file_identity(result) == identity
+    synthesize_video(str(movie), subtitles=True, resolution='144p', subtitle_position='top')
+    assert file_identity(result) != identity
+    identity = file_identity(result)
     synthesize_video(str(movie), subtitles=True, speed_up=2, resolution='144p')
     assert stream_durations(result)['video'] == pytest.approx(1.5, abs=.08)
     assert file_identity(result) != identity
@@ -123,6 +126,23 @@ def test_volume_works_without_extra_bgm(movie):
     samples = subprocess.run(['ffmpeg', '-v', 'error', '-i', result, '-f', 'f32le', '-ac', '1', '-'],
                               check=True, capture_output=True).stdout
     assert np.max(np.abs(np.frombuffer(samples, dtype=np.float32))) < .0001
+
+
+@pytest.mark.parametrize('position', ['top', 'bottom'])
+def test_subtitles_render_in_the_selected_part_of_the_picture(movie, position):
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+        'color=black:size=320x180:rate=30:duration=2', '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p', str(movie/'download.mp4')], check=True)
+    result = synthesize_video(str(movie), resolution='144p', subtitle_position=position)
+    frame = subprocess.run(['ffmpeg', '-v', 'error', '-ss', '0.3', '-i', result,
+        '-frames:v', '1', '-vf', 'scale=256:144', '-pix_fmt', 'gray', '-f', 'rawvideo', '-'],
+        capture_output=True, check=True).stdout
+    pixels = np.frombuffer(frame, np.uint8).reshape(144, 256)
+    # Small anti-aliased glyphs need not contain fully white pixel interiors.
+    ys, xs = np.where(pixels > 80)
+    assert len(ys) > 10
+    assert .35 < xs.mean()/256 < .65
+    assert (ys.max() < 36) if position == 'top' else (ys.min() > 108)
 
 
 def test_failed_encode_does_not_report_old_output_as_success(movie):
@@ -213,6 +233,7 @@ def test_fish_request_cache_and_atomic_invalid_response(tmp_path, monkeypatch):
     assert len(calls) == 1
     tts_fish.tts('Really?', path, 'English', 'voice-b', speed=1)
     assert len(calls) == 2
+
     tts_fish.tts('Really?', path, 'English', 'voice-b', speed=1.05)
     assert len(calls) == 3
     assert calls[-1]['prosody']['speed'] == 1.05
@@ -319,8 +340,10 @@ def test_ui_contracts_and_local_http_configuration(monkeypatch):
     assert '配音語速（整片固定）' in labels
     assert '英文譯文字數預算（每秒詞）' in labels
     assert '本片翻譯風格／需求（可自由修改）' in labels
+    assert '以原片字幕為翻譯依據' in labels
+    assert '翻譯字幕位置' in labels
     for event in webui.app.fns.values():
-        if event.fn == webui.do_everything_with_cost:
+        if event.fn in (webui.do_everything_with_cost, webui.synthesize_from_ui):
             inspect.signature(event.fn).bind(*([None] * len(event.inputs)))
         if event.fn is not webui.stop_running_job:
             assert event.concurrency_id == 'dubbing-project'
@@ -535,3 +558,23 @@ def test_repeated_invalid_shortening_stops_without_five_paid_attempts(monkeypatc
     result,_=mod._shorten_one(line(0,1,'我需要你留下来帮我做完这件事。',current),'English','OpenAI',[])
     assert result == current
     assert len(calls) == 2
+
+@pytest.mark.parametrize('gap,same_speaker,merged', [(2.0, True, False), (.1, False, False), (.1, True, True)])
+def test_asr_merge_text_and_timing_are_applied_together(monkeypatch, tmp_path, gap, same_speaker, merged):
+    from tools import asr_repair as mod
+    from tools import translation_backends
+    cards = [line(0, 1, '今天下雨了'), line(1 + gap, 2 + gap, '记得带伞')]
+    if not same_speaker:
+        cards[1]['speaker'] = 'SPEAKER_01'
+    original = json.loads(json.dumps(cards))
+    monkeypatch.setattr(translation_backends, 'llm_translate', lambda *a, **k:
+        json.dumps({'fixes': [{'index': 0, 'merge': [1], 'text': '今天下雨了，记得带伞'}]}))
+    monkeypatch.setattr(mod, '_speaker_audit', lambda rows, bible, method, allowed, created, progress:
+        (0, created, rows))
+    result = mod._ai_repair(str(tmp_path), cards, {}, 'OpenAI')[-1]
+    if merged:
+        assert len(result) == 1
+        assert result[0]['text'] == '今天下雨了，记得带伞'
+        assert result[0]['orig_end'] == 2 + gap
+    else:
+        assert result == original
