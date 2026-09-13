@@ -121,25 +121,29 @@ def load_source_bible(folder):
 
 
 def review_bible_context(folder, summary=None):
-    """English outline plus the locked Chinese source outline.
+    """Context from both languages, with original dialogue retaining authority.
 
     Review used to see only summary.json. A retranslate can rewrite that file
     thinner and drop beats. source_bible.json keeps the plot.
     """
     parts = []
     source = load_source_bible(folder)
-    source_text = bible_context(source)
+    # Generated source glossaries may contain tentative target spellings.
+    # The current target glossary supplies those; source facts remain available.
+    source_text = bible_context({**source, 'glossary': ''} if summary else source)
     if source_text:
-        parts.append('Source plot (Chinese, locked; this is the episode of record):')
+        parts.append('Automatically inferred source context (Chinese; may be incomplete or wrong):')
         parts.append(source_text)
     target_text = bible_context(summary)
     if target_text:
-        parts.append('Target-language outline (names and spellings; may omit beats):')
+        parts.append('Current target-language context and glossary:')
         parts.append(target_text)
     if source_text:
         parts.append(
-            'If the Chinese source outline or a Chinese line states a plot beat, keep it. '
-            'Do not "correct" it to match a shorter English outline.'
+            'The original dialogue and independent caption evidence take precedence over '
+            'generated outlines. Never delete a spoken clause or call it noise solely because '
+            'an inferred outline omits or contradicts it. Use the current target glossary '
+            'for consistent names; earlier provisional target spellings are not binding.'
         )
     return '\n'.join(parts)
 
@@ -156,7 +160,7 @@ def _extract_json_object(text):
     return json.loads(text[start:end + 1])
 
 
-OUTLINE_VERSION = 3
+OUTLINE_VERSION = 4
 
 
 def _summary_has_bible(summary, target_language):
@@ -208,7 +212,9 @@ def _transcript_for_bible(transcript, max_chars=8000):
         seen.add(text)
         speaker = line.get('speaker') or ''
         prefix = f'{speaker}: ' if speaker else ''
-        lines.append(f'{i}. {prefix}{text}')
+        evidence = line.get('source_subtitle_evidence') or []
+        caption_note = f' | Visible captions: {json.dumps(evidence, ensure_ascii=False)}' if evidence else ''
+        lines.append(f'{i}. {prefix}{text}{caption_note}')
     blob = '\n'.join(lines)
     if len(blob) <= max_chars:
         return blob
@@ -255,7 +261,8 @@ def build_dubbing_bible(info, transcript, target_language, method='OpenAI'):
         return None
     locked = as_bible_text((info or {}).get('source_glossary'))
     lock_note = (
-        f'These Chinese names are already decided. Keep the left side, give one {lang} spelling, do not rename:\n{locked}\n'
+        f'Keep these source names on the left. Their earlier target spellings are provisional. '
+        f'Choose one concise, idiomatic, speakable {lang} name for each identity:\n{locked}\n'
         if locked else ''
     )
     user = (
@@ -267,6 +274,10 @@ def build_dubbing_bible(info, transcript, target_language, method='OpenAI'):
         f'Write a dubbing bible in {lang} as JSON only:\n'
         '{"title":"", "summary":"", "outline":"", "glossary":"", "voices":""}\n'
         'Use ONLY events, items, and names that appear in the dialogue. '
+        'Visible caption quotes are independent evidence in chronological order. '
+        'Use complete displayed utterances to recover question/answer and vocative '
+        'boundaries; ASR may have glued different turns together. Do not let a '
+        'speaker cluster or missing ASR punctuation move a name into the wrong utterance. '
         'Do not invent a different plot from the title.\n'
         'summary: 2-5 sentences of what actually happens.\n'
         'outline: 6-12 short beats in dialogue order.\n'
@@ -275,7 +286,11 @@ def build_dubbing_bible(info, transcript, target_language, method='OpenAI'):
         'Generic objects, speaker roles, and unnamed organizations are descriptions, not names; '
         'use normal target-language capitalization for them. '
         f'{_glossary_example(lang)}'
-        'Keep those spellings forever. No Chinese on the right side.\n'
+        'Prefer short, distinctive names suited to spoken dialogue. Do not turn one skill '
+        'name into several clauses or a long explanation of its mechanics; those details '
+        'belong in the dialogue. Preserve identity and distinctive meaning through idiomatic '
+        'localization, not a word-for-word chain of nouns. Reuse the chosen names consistently '
+        'throughout this episode. No Chinese on the right side.\n'
         'voices: narrator, system UI, inner monologue/self-talk, and main speakers, plus tone. '
         'If a walk-on speaker (clerk, waiter, extra) has lines glued onto a lead, name that role '
         'separately and say which SPEAKER_* id those lines currently sit on. '
@@ -292,7 +307,13 @@ def build_dubbing_bible(info, transcript, target_language, method='OpenAI'):
     last_error = ''
     for _retry in range(2):
         try:
-            response = llm_translate(method, messages)
+            # This outline governs all later source repairs and terminology.
+            # Use the main reviewer instead of inheriting the parallel writer's
+            # effort/credential settings for this shared decision.
+            response = llm_translate(
+                method, messages, model=os.getenv('REVIEW_MODEL_NAME') or None,
+                reasoning_effort=os.getenv('REVIEW_REASONING_EFFORT') or 'high', purpose='review',
+            )
             data = _extract_json_object(response)
             title = as_bible_text(data.get('title')) or (info.get('title') or '')
             plot = as_bible_text(data.get('summary'))

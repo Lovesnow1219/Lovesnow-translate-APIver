@@ -96,11 +96,14 @@ def test_failed_review_remains_visible_and_cannot_be_cached_as_passed(tmp_path, 
 def test_episode_brief_reaches_bible_generation(monkeypatch):
     from tools import translation_bible as mod
     messages = []
-    def respond(method, request):
+    def respond(method, request, **kwargs):
+        assert kwargs['purpose'] == 'review'
+        assert kwargs['model'] == 'main-review-model'
         messages.extend(request)
         return json.dumps({'title': 'Example', 'summary': 'A workplace discussion.',
                            'outline': 'The characters discuss work.', 'glossary': '', 'voices': ''})
     monkeypatch.setattr(mod, 'llm_translate', respond)
+    monkeypatch.setenv('REVIEW_MODEL_NAME', 'main-review-model')
     brief = 'Preserve ordinary workplace terminology and dry humor.'
     mod.build_dubbing_bible({'title': 'Example', 'uploader': 'Example', 'dubbing_style': brief},
         [{'text': '大家正在讨论新的工作安排和待遇。' * 8}], 'English')

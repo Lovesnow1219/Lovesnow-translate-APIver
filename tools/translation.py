@@ -69,10 +69,10 @@ def _prepare_source_lines(transcript, target_language, folder=None):
             from tools.asr_gaps import recover_missing_speech
             lines = recover_missing_speech(folder, lines)
         else:
-            from tools.asr_gaps import recover_leading_speech
             from tools.line_roles import promote_bgm_speech
             promote_bgm_speech(lines)
-            lines = recover_leading_speech(folder, lines)
+            # A source checkpoint already reviewed must not acquire unreviewed
+            # ASR words during translation. Recovery belongs before source QC.
         lines = ensure_repaired_transcript(folder, lines)
         repaired = already_repaired(folder)
     if not repaired and (uses_word_budget(target_language) or uses_char_budget(target_language)):
@@ -705,8 +705,9 @@ def translate(method, folder, target_language='简体中文'):
         if needs_translation_refresh(target_language):
             logger.info(f'依大綱從原文重翻：{folder}')
             return refresh_translation_lines(folder, target_language, method)
-        logger.info(f'收緊譯文字數以塞進原句槽位：{folder}')
-        return tighten_overlong_lines(folder, target_language, method)
+        logger.info(f'審核既有譯文，配音後再量測時長：{folder}')
+        _review_after_write(folder, target_language, method)
+        return True
     if os.path.exists(translation_path) and not _same_lang(
         load_dub_meta(folder).get('translation'), target_language, 'translation'
     ):
@@ -746,7 +747,7 @@ def _review_after_write(folder, target_language, method):
         mark_stage('字幕審核修改...')
         report = review_folder(folder, target_language, method=method)
         n = len((report or {}).get('findings') or [])
-        picks = auto_apply_review_picks(folder, target_language)
+        picks = auto_apply_review_picks(folder, target_language, method=method)
         if picks:
             _, applied, skipped, message, _ = apply_selected_review(
                 folder, target_language, picks,
@@ -756,7 +757,7 @@ def _review_after_write(folder, target_language, method):
             logger.info(f'審稿標出 {n} 句，沒有可套用的建議譯文：{folder}')
         else:
             logger.info(f'審稿未標異常：{folder}')
-        tighten_overlong_lines(folder, target_language, method=method)
+        # Keep the reviewed wording. Actual speech duration is checked after TTS.
     except Exception as exc:
         from tools.job_control import JobStopped
         if isinstance(exc, JobStopped):

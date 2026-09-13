@@ -2,7 +2,6 @@
 import base64
 import copy
 import json
-import math
 import os
 import re
 import subprocess
@@ -13,7 +12,7 @@ from tools.dubbing_settings import file_identity, read_json, write_json_atomic
 
 SETTINGS = 'source_subtitle_settings.json'
 REPORT = 'source_subtitle_review.json'
-VERSION = 3
+VERSION = 7
 MAX_FRAMES = 48
 BATCH_CARDS = 8
 
@@ -65,24 +64,38 @@ def apply_evidence(lines, corrections, frame_owners):
         if not quotes:
             continue
         original = text = result[index].get('text') or ''
-        applied = []
+        applied, spans = [], []
         for edit in edits:
             if not isinstance(edit, dict):
                 continue
             old, new = edit.get('from'), edit.get('to')
             if not isinstance(old, str) or not isinstance(new, str) or not old.strip() or not new.strip():
                 continue
-            if text.count(old) != 1 or not _compact(new):
+            matches = list(re.finditer(re.escape(old), original))
+            occurrence = edit.get('occurrence', 1 if len(matches) == 1 else None)
+            if type(occurrence) is not int or not 1 <= occurrence <= len(matches) or not _compact(new):
                 continue
             if not any(_compact(new) in _compact(quote) for quote in quotes):
                 continue
-            if old == text and len({frame for frame, quote in visible if _compact(new) in quote}) < 2:
+            compact_old, compact_new = _compact(old), _compact(new)
+            if compact_new in compact_old or (old != original and compact_old in compact_new):
+                # A partial caption cannot prove deletion of unseen speech or
+                # justify appending the next caption. Even two copies of a
+                # partial caption cannot prove deletion of a whole-card tail.
+                continue
+            if old == original and len({frame for frame, quote in visible if _compact(new) in quote}) < 2:
                 # A whole-line override needs corroboration in distinct frames.
                 continue
             if len(new) > max(2 * len(old), len(old) + 8):
                 continue
-            text = text.replace(old, new, 1)
-            applied.append({'from': old, 'to': new})
+            start, end = matches[occurrence - 1].span()
+            if any(start < right and end > left for left, right, _ in spans):
+                continue
+            spans.append((start, end, new))
+            applied.append({'from': old, 'to': new, 'occurrence': occurrence})
+        # All occurrence numbers refer to the original card, not previous edits.
+        for start, end, replacement in sorted(spans, reverse=True):
+            text = text[:start] + replacement + text[end:]
         if text != original:
             result[index]['text'] = text
             result[index]['source_subtitle_evidence'] = list(dict.fromkeys(
@@ -100,6 +113,67 @@ def preserves_caption_terms(line, proposed):
                for term in line.get('source_subtitle_terms', []))
 
 
+def apply_observations(lines, observations, frame_owners):
+    """Keep chronological caption evidence even when ASR needs no spelling edit."""
+    result, accepted, by_index = copy.deepcopy(lines), [], {}
+    for item in observations:
+        if not isinstance(item, dict) or type(item.get('index')) is not int:
+            continue
+        index = item['index']
+        if not 0 <= index < len(result) or not isinstance(item.get('evidence'), list):
+            continue
+        frames = by_index.setdefault(index, {})
+        for row in item['evidence']:
+            if (not isinstance(row, dict) or type(row.get('frame')) is not int
+                    or frame_owners.get(row['frame']) != index
+                    or not isinstance(row.get('text'), str)):
+                continue
+            quote = row['text'].strip()
+            if quote and len(quote) <= 300:
+                frames[row['frame']] = quote
+    for index, frames in by_index.items():
+        if not frames:
+            continue
+        ordered = [{'frame': frame, 'text': quote} for frame, quote in sorted(frames.items())]
+        quotes = list(dict.fromkeys(row['text'] for row in ordered))
+        result[index]['source_subtitle_evidence'] = quotes
+        accepted.append({'index': index, 'evidence': ordered})
+    return result, accepted
+
+
+def replay_observations(transcript, report, video_identity):
+    """Repair v6 evidence grouping without paying for identical video frames.
+
+    Only replay against the exact checked source, before later ASR edits/merges.
+    A changed input or an older correction policy requires a fresh visual pass.
+    """
+    if (report.get('version') != 6 or not report.get('completed')
+            or report.get('video') != video_identity
+            or not isinstance(report.get('input_transcript'), list)
+            or not isinstance(report.get('observations'), list)):
+        return None
+    expected = copy.deepcopy(report['input_transcript'])
+    for change in report.get('corrections', []):
+        index = change.get('index')
+        if (type(index) is not int or not 0 <= index < len(expected)
+                or expected[index].get('text') != change.get('before')
+                or not isinstance(change.get('after'), str)):
+            return None
+        expected[index]['text'] = change['after']
+    keys = ('text', 'speaker', 'start', 'end', 'orig_start', 'orig_end')
+    signature = lambda rows: [{key: row.get(key) for key in keys} for row in rows]
+    if signature(expected) != signature(transcript):
+        return None
+    owners = {}
+    for item in report['observations']:
+        for row in item.get('evidence', []):
+            frame, index = row.get('frame'), item.get('index')
+            if type(frame) is not int or type(index) is not int or owners.get(frame, index) != index:
+                return None
+            owners[frame] = index
+    return apply_observations(transcript, report['observations'], owners)
+
+
 def _frame(video, seconds):
     result = subprocess.run(
         ['ffmpeg', '-v', 'error', '-ss', str(seconds), '-i', video, '-frames:v', '1',
@@ -115,26 +189,29 @@ def _frame(video, seconds):
 def sample_times(lines, candidates, duration):
     """Cover caption changes and modest ASR timestamp error within a fixed cap."""
     from tools.vocal_particles import card_start, card_end
-    plans, remaining = {}, {}
-    for index in candidates:
+    windows = {}
+    for index in candidates[:MAX_FRAMES]:
         start = max(0.0, card_start(lines[index]) - .3)
         end = min(max(0.0, duration - .05), card_end(lines[index]) + .3)
         if end < start:
             continue
-        middle = (start + end) / 2
-        plans[index] = [middle]
-        count = min(12, max(2, math.ceil(end - start) + 1))
-        remaining[index] = sorted(
-            [start + (end - start) * i / (count - 1) for i in range(count)
-             if abs(start + (end - start) * i / (count - 1) - middle) > .05],
-            key=lambda t: -abs(t - middle))
-    available = MAX_FRAMES - len(plans)
-    while available and any(remaining.values()):
-        for index in plans:
-            if available and remaining[index]:
-                plans[index].append(remaining[index].pop(0))
-                available -= 1
-    return {index: sorted(times) for index, times in plans.items()}
+        windows[index] = (start, end)
+    if len(windows) * 2 > MAX_FRAMES:
+        return {index: [(start + end) / 2] for index, (start, end) in windows.items()}
+    plans = {index: sorted({start, end}) for index, (start, end) in windows.items()}
+    # Allocate the remaining evidence budget to the largest temporal gaps.
+    # A long multi-caption card needs more samples than a brief reaction.
+    while sum(map(len, plans.values())) < MAX_FRAMES:
+        gaps = [(right - left, index, (left + right) / 2)
+                for index, times in plans.items() if len(times) < 12
+                for left, right in zip(times, times[1:])]
+        if not gaps:
+            break
+        gap, index, middle = max(gaps)
+        if gap <= .25:
+            break
+        plans[index] = sorted(plans[index] + [middle])
+    return plans
 
 
 def review_source_subtitles(folder, transcript):
@@ -147,6 +224,18 @@ def review_source_subtitles(folder, transcript):
     from tools.audio_chunks import media_duration
 
     video = os.path.join(folder, 'download.mp4')
+    previous = read_json(os.path.join(folder, REPORT), {})
+    replayed = replay_observations(transcript, previous, file_identity(video))
+    if replayed is not None:
+        lines, observations = replayed
+        from tools.target_language import clear_asr_downstream
+        summary = read_json(os.path.join(folder, 'summary.json'), {})
+        clear_asr_downstream(folder, keep_bible=bool(summary.get('outline_locked')))
+        write_json_atomic(os.path.join(folder, 'transcript.json'), lines)
+        previous.update(version=VERSION, observations=observations, evidence_replayed=True)
+        write_json_atomic(os.path.join(folder, REPORT), previous)
+        logger.info('重用已完成的畫面對照，修復字幕證據分組；不新增視覺 API 請求')
+        return lines
     # Sample across the episode when it has more cards than the request limit.
     candidates = [i for i, line in enumerate(transcript)
                   if (line.get('text') or '').strip() and not is_particle_card(line.get('text'))]
@@ -154,7 +243,7 @@ def review_source_subtitles(folder, transcript):
         candidates = [candidates[round(i * (len(candidates) - 1) / (MAX_FRAMES - 1))]
                       for i in range(MAX_FRAMES)]
     lines = copy.deepcopy(transcript)
-    accepted, errors, frames = [], [], 0
+    accepted, observations, errors, frames = [], [], [], 0
     reviewed = set()
     plans = sample_times(lines, candidates, media_duration(video))
     for offset in range(0, len(candidates), BATCH_CARDS):
@@ -188,20 +277,35 @@ def review_source_subtitles(folder, transcript):
                     'Only replace a whole card when the SAME complete caption is visible in at least '
                     'two distinct frames and covers that whole card; cite both frames. '
                     'Never replace a multi-caption card using only one of its partial captions. '
+                    'A caption not visible in sampled frames is NOT evidence that the words were '
+                    'not spoken. Never delete an unsampled phrase or append words from a neighboring '
+                    'card. For partial edits, change only the misrecognized characters, not a long '
+                    'surrounding passage or its punctuation. Pure insertion/deletion in partial '
+                    'edits is not accepted. '
                     'Use small exact substring edits. The replacement must appear verbatim in a cited caption. '
+                    'If an ASR substring repeats, specify its 1-based occurrence in the ORIGINAL card. '
+                    'Propose a separate edit for each supported occurrence; never assume all repeats '
+                    'need the same correction. Do not collapse deliberate repetition. '
                     'Copy each cited caption exactly as visible, without correcting its spelling. '
-                    'Return JSON only: {"corrections":[{"index":0,"evidence":[{"frame":0,"text":"visible caption"}],'
-                    '"edits":[{"from":"exact ASR substring","to":"exact caption substring"}]}]}. '
+                    'Also record clear matching dialogue captions in chronological order even when '
+                    'no text correction is needed. Later editors need their utterance boundaries. '
+                    'Do not combine two separately displayed complete utterances into one quote. '
+                    'Return JSON only: {"observations":[{"index":0,"evidence":[{"frame":0,"text":"visible caption"}]}],'
+                    '"corrections":[{"index":0,"evidence":[{"frame":0,"text":"visible caption"}],'
+                    '"edits":[{"from":"exact ASR substring","to":"exact caption substring","occurrence":1}]}]}. '
                     'Use an empty corrections list when no safe correction is supported.'
                 )},
                 {'role': 'user', 'content': content},
             ], model=os.getenv('REVIEW_MODEL_NAME') or 'gpt-5.6-sol',
                 reasoning_effort=os.getenv('REVIEW_REASONING_EFFORT') or 'high', timeout=180, purpose='review')
-            corrections = _extract_json_object(raw).get('corrections')
-            if not isinstance(corrections, list):
+            response = _extract_json_object(raw)
+            corrections, seen = response.get('corrections'), response.get('observations')
+            if not isinstance(corrections, list) or not isinstance(seen, list):
                 raise ValueError('字幕對照回應格式錯誤')
             lines, changes = apply_evidence(lines, corrections, owners)
+            lines, observed = apply_observations(lines, seen, owners)
             accepted.extend(changes)
+            observations.extend(observed)
             reviewed.update(owners.values())
         except JobStopped:
             raise
@@ -210,7 +314,7 @@ def review_source_subtitles(folder, transcript):
             errors.append(type(exc).__name__)
             logger.warning(f'原片字幕對照未完成：{type(exc).__name__}；保留未確認的原句')
             break
-    if accepted:
+    if accepted or observations:
         # Source changes invalidate generated translations in every language.
         # Keep the input and evidence in the report for inspection/recovery.
         from tools.target_language import clear_asr_downstream
@@ -220,7 +324,8 @@ def review_source_subtitles(folder, transcript):
     write_json_atomic(os.path.join(folder, REPORT), {
         'version': VERSION, 'video': file_identity(video), 'completed': not errors,
         'sampled_frames': frames, 'sampled_cards': len(reviewed), 'total_cards': len(transcript),
-        'corrections': accepted, 'errors': errors, 'input_transcript': transcript,
+        'corrections': accepted, 'observations': observations,
+        'errors': errors, 'input_transcript': transcript,
     })
     if errors:
         logger.warning('原片字幕對照未完成；未確認的句子保留原文，詳見校對報告')

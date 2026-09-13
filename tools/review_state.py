@@ -12,6 +12,10 @@ def failures(folder, language=None):
         return {}
     language = translation_language(language or load_dub_meta(folder).get('translation') or 'English')
     result = dict(read_json(os.path.join(folder, NAME), {}).get(language, {}))
+    from tools.source_validation import REPORT as SOURCE_REPORT
+    source_stages = read_json(os.path.join(folder, SOURCE_REPORT), {}).get('stages', {})
+    if any(not stage.get('complete') for stage in source_stages.values()):
+        result['原文改寫覆核'] = 'Incomplete'
     from tools.source_subtitles import SETTINGS, REPORT
     if read_json(os.path.join(folder, SETTINGS), {}).get('enabled'):
         report = read_json(os.path.join(folder, REPORT), {})

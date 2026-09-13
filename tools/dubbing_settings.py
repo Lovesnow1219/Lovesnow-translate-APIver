@@ -77,7 +77,7 @@ def render_fingerprint(folder, language, voice=None):
     wav_dir = os.path.join(folder, 'wavs')
     wavs = [file_identity(os.path.join(wav_dir, f'{i:04d}.wav')) for i in range(len(lines))]
     return fingerprint({
-        'version': 1, 'language': translation_language(language), 'lines': source,
+        'version': 2, 'language': translation_language(language), 'lines': source,
         'settings': load_delivery_settings(folder), 'voice': voice,
         'voices': read_json(os.path.join(folder, 'speaker_voices.json'), {}),
         'voice_override': os.getenv('FISH_VOICE_ID', ''),

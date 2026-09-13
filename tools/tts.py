@@ -48,6 +48,8 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
         os.makedirs(output_folder)
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript = json.load(f)
+    from tools.asr import ensure_speaker_audio
+    ensure_speaker_audio(folder, transcript)
     from tools.vocal_particles import (
         ensure_particle_translation_lead,
         is_particle_card,
@@ -107,6 +109,8 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
         clear_tts_cache(folder)
         os.makedirs(output_folder, exist_ok=True)
     from tools.line_roles import should_skip_dub
+    from tools.source_vocalizations import preserve_laughter
+    source_vocals = _load_vocals(folder)
 
     def _line_job(i, line):
         speaker = line['speaker']
@@ -115,6 +119,10 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
             text = preprocess_text(line.get('text') or '', target_language)
         source_text = line.get('text') or ''
         output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
+        if not should_skip_dub(line) and preserve_laughter(folder, line, output_path, source_vocals):
+            logger.info(f'保留原片純笑聲與時長：#{i}')
+            return None
+        line.pop('audio_source', None)
         if is_asr_junk(source_text) or should_skip_dub(line) or not (text or '').strip():
             silence = np.zeros((max(8, int(0.08 * 24000)),), dtype=np.float32)
             save_wav(silence, output_path)
@@ -168,24 +176,11 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
     map_parallel(_synth, jobs, workers)
 
     from tools.job_control import check_stop
-    from tools.translation import tighten_overlong_lines
     from tools.translation_versions import write_translation
     write_translation(folder, transcript, target_language)
     check_stop()
-    _summary, transcript = tighten_overlong_lines(
-        folder, target_language, slack=100, ignore_wav_stale=True,
-    )
-    redo = []
-    for i, line in enumerate(transcript):
-        output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
-        if os.path.isfile(output_path):
-            continue
-        job = _line_job(i, line)
-        if job:
-            redo.append(job)
-    if redo:
-        logger.info(f'音檔仍超槽，已收緊並重合成 {len(redo)} 句')
-        map_parallel(_synth, redo, workers)
+    # Measure approved dialogue as spoken. Timing repairs go through the main
+    # reviewer below, never an unreviewed word-budget rewrite after approval.
 
     wav_paths = [
         os.path.join(output_folder, f'{str(i).zfill(4)}.wav')

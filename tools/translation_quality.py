@@ -841,7 +841,6 @@ def valid_translation(text, translation, target_language='简体中文', duratio
         return False, 'Only output the translation.'
 
     translation = _unwrap_translation(translation)
-    scale = max(0.5, float(budget_scale or 1.0))
 
     if uses_word_budget(target_language) or uses_char_budget(target_language):
         lang = translation_language(target_language)
@@ -853,24 +852,8 @@ def valid_translation(text, translation, target_language='简体中文', duratio
         incomplete = _incomplete_reason(text, cleaned, target_language, duration)
         if incomplete:
             return False, incomplete
-        if duration is not None and uses_word_budget(target_language):
-            budget = max(2, int(round(_spoken_word_budget(duration, target_language) * scale)))
-            words = len(cleaned.split())
-            if words > budget + _word_slack(target_language):
-                unit = 'syllables' if lang == 'Vietnamese' else 'spoken words'
-                return False, (
-                    f'Too long for a {float(duration):.1f}s dubbing line. '
-                    f'Rewrite in at most {budget} {lang} {unit}. '
-                    'Keep names and meaning. Output only the translation.'
-                )
-        if duration is not None and uses_char_budget(target_language):
-            budget = max(4, int(round(_spoken_char_budget(duration, target_language) * scale)))
-            if len(cleaned) > budget + _char_slack(target_language):
-                return False, (
-                    f'Too long for a {float(duration):.1f}s dubbing line. '
-                    f'Rewrite in at most {budget} {lang} characters. '
-                    'Keep names and meaning. Output only the translation.'
-                )
+        # Text length estimates guide drafting; they do not establish whether
+        # an actor can say a line naturally. Review measured WAVs after TTS.
         return True, cleaned
 
     if len(text) <= 10:

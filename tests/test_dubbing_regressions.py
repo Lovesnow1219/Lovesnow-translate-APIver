@@ -313,7 +313,9 @@ def test_actual_tts_pipeline_uses_one_speed_for_short_and_long_lines(tmp_path, m
     monkeypatch.setattr(tts, 'assign_speaker_voices', lambda *a, **k: ({}, False))
     monkeypatch.setattr(tts, 'voice_for_method', lambda *a, **k: 'voice-test')
     monkeypatch.setattr('tools.api_keys.workers_for_keys', lambda *a: (1, 1))
-    monkeypatch.setattr('tools.translation.tighten_overlong_lines', lambda *a, **k: ({}, lines))
+    def no_unreviewed_rewrite(*a, **k):
+        pytest.fail('TTS must not overwrite approved dialogue with a word-budget rewrite')
+    monkeypatch.setattr('tools.translation.tighten_overlong_lines', no_unreviewed_rewrite)
     speeds = []
     def fake_tts(text, path, **kwargs):
         speeds.append(kwargs['speed'])
@@ -569,7 +571,8 @@ def test_asr_merge_text_and_timing_are_applied_together(monkeypatch, tmp_path, g
     original = json.loads(json.dumps(cards))
     monkeypatch.setattr(translation_backends, 'llm_translate', lambda *a, **k:
         json.dumps({'fixes': [{'index': 0, 'merge': [1], 'text': '今天下雨了，记得带伞'}]}))
-    monkeypatch.setattr(mod, '_speaker_audit', lambda rows, bible, method, allowed, created, progress:
+    monkeypatch.setattr('tools.source_validation.validate_source_repairs', lambda folder, rows, fixes, *a: fixes)
+    monkeypatch.setattr(mod, '_speaker_audit', lambda rows, bible, method, allowed, created, progress, **k:
         (0, created, rows))
     result = mod._ai_repair(str(tmp_path), cards, {}, 'OpenAI')[-1]
     if merged:

@@ -16,7 +16,7 @@ from tools.target_language import is_asr_junk
 
 REPAIR_NAME = 'asr_repair.json'
 SOURCE_BIBLE_NAME = 'source_bible.json'
-REPAIR_VERSION = 4
+REPAIR_VERSION = 5
 _BATCH = 36
 _OVERLAP = 4
 _AUDIT_BATCH = 200
@@ -419,7 +419,7 @@ def _apply_speaker_item(transcript, item, allowed_speakers, created):
     return moved
 
 
-def _speaker_audit(transcript, bible, method, allowed_speakers, created, progress_callback=None):
+def _speaker_audit(transcript, bible, method, allowed_speakers, created, progress_callback=None, folder=None):
     from tools.job_control import check_stop
     from tools.translation_backends import llm_translate
     from tools.translation_bible import bible_context
@@ -476,6 +476,8 @@ def _speaker_audit(transcript, bible, method, allowed_speakers, created, progres
     for item in fixes:
         by_index[int(item['index'])] = item
     items = list(by_index.values())[:_MAX_AUDIT_FIXES]
+    from tools.source_validation import validate_source_repairs
+    items = validate_source_repairs(folder, transcript, items, method, 'speaker_audit')
     moved = 0
     for item in items:
         moved += _apply_speaker_item(transcript, item, allowed_speakers, created)
@@ -501,6 +503,9 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         'That outline is provisional and is NOT independent evidence for uncertain words. '
         'Visible source captions, when provided, are direct evidence from this video. '
         'Preserve their spelling and facts over guesses in the ASR-derived outline. '
+        'Caption quotes are in chronological order. Use complete displayed utterances '
+        'to recover sentence and question/answer boundaries. Do not move a name or '
+        'vocative across those boundaries merely to make the ASR outline consistent. '
         'Fix misheard words when the outline and nearby cards make the intended word clear. '
         'Resolve homophones only when the current episode context supports the correction; otherwise preserve the source. '
         'Join consecutive SAME-speaker cards that are one spoken sentence. '
@@ -526,7 +531,7 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         allowed = set(range(start, end))
         _progress(progress_callback, f'辨識後修稿 {batch_i}/{batches}（卡片 {start}–{end - 1}）…')
         payload = [
-            'Chinese ASR cards. Repair against the outline. Do not invent plot.',
+            'Chinese ASR cards. Prioritize visible captions and nearby source over provisional outline guesses. Do not invent plot.',
             outline,
             '',
         ]
@@ -542,6 +547,8 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         )
         fixes.extend(_parse_fixes(raw, allowed))
 
+    from tools.source_validation import validate_source_repairs
+    fixes = validate_source_repairs(folder, transcript, fixes, method, 'asr_repair')
     from tools.line_roles import SPEAKER_NARR, SPEAKER_SYS
     allowed_speakers = set(_known_speakers(transcript))
     allowed_speakers.update({SPEAKER_SYS, SPEAKER_NARR})
@@ -616,7 +623,7 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
             del transcript[index]
     try:
         audit_n, created, transcript = _speaker_audit(
-            transcript, bible, method, allowed_speakers, created, progress_callback,
+            transcript, bible, method, allowed_speakers, created, progress_callback, folder=folder,
         )
         moved_n += audit_n
     except Exception as exc:

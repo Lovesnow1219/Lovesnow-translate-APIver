@@ -71,6 +71,21 @@ def generate_speaker_audio(folder, transcript):
         save_wav(audio, speaker_file_path)
 
 
+def ensure_speaker_audio(folder, transcript):
+    """Rebuild missing reference clips when an ASR checkpoint is reused."""
+    if not os.path.isfile(os.path.join(folder, 'audio_vocals.wav')):
+        return
+    missing = {line['speaker'] for line in transcript if line.get('speaker')
+               and not os.path.isfile(os.path.join(folder, 'SPEAKER', f"{line['speaker']}.wav"))}
+    if not missing:
+        return
+    from tools.vocal_particles import card_start, card_end
+    source_lines = [{**line, 'start': card_start(line), 'end': card_end(line)}
+                    for line in transcript if line.get('speaker') in missing]
+    generate_speaker_audio(folder, source_lines)
+    logger.info(f'已從原音重建 {len(missing)} 個缺少的講者參考音檔')
+
+
 def transcribe_audio(method, folder, model_name: str = 'large', download_root='models/ASR/whisper', device='auto', batch_size=32, diarization=True,min_speakers=None, max_speakers=None, language=None):
     from tools.target_language import asr_language_code, clear_asr_downstream, load_dub_meta, save_dub_meta
 

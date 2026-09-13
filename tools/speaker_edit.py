@@ -301,11 +301,7 @@ def redub_speakers(folder, language, table=None):
     activate_language(folder, language)
     if speaker_changed:
         clear_tts_cache(folder)
-    from tools.translation import tighten_overlong_lines
-    from tools.translation_review import applied_review_indices
-    applied_idx = applied_review_indices(folder, language)
-    if applied_idx:
-        tighten_overlong_lines(folder, language, indices=applied_idx, slack=2)
+    # Redub the saved wording; measured timing repairs use the reviewed path.
     tts_lang = tts_language(language)
     result = generate_wavs('Fish', folder, language)
     if isinstance(result, str):

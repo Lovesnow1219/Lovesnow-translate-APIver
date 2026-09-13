@@ -233,11 +233,11 @@ def load_dub_meta(folder):
 
 AUDIO_MIX_VERSION = 7
 AUDIO_LAYOUT_VERSION = 6
-TRANSLATION_VERSION = 7
+TRANSLATION_VERSION = 8
 LANGUAGE_TRANSLATION_VERSION = {
-    'English': 11,
-    'Vietnamese': 8,
-    'Japanese': 11,
+    'English': 13,
+    'Vietnamese': 9,
+    'Japanese': 12,
 }
 
 
