@@ -405,9 +405,9 @@ def _download_sample(voice_id):
         url = str((samples[0] or {}).get('audio') or '').strip() if samples else ''
         if not url:
             return None
-        audio = requests.get(url, headers=headers, timeout=60)
-        if audio.status_code != 200 or not audio.content:
-            audio = requests.get(url, timeout=60)
+        # Samples are public or signed media URLs. Never forward the account's
+        # API credential to a CDN / arbitrary URL returned in model metadata.
+        audio = requests.get(url, timeout=60)
         if audio.status_code != 200 or len(audio.content or b'') < 2048:
             return None
         os.makedirs(_CACHE_DIR, exist_ok=True)
@@ -451,6 +451,7 @@ def ensure_stock_prints(voices, tts_fn=None):
     """Fingerprints for stock voices. Prefer official samples, else a short TTS probe."""
     os.makedirs(_CACHE_DIR, exist_ok=True)
     meta = _load_meta()
+    active_kind = _EMBED_KIND if _ge2e_encoder_model() is not None else 'mfcc'
     prints = {}
     pending = []
     for voice in voices or ():
@@ -458,7 +459,7 @@ def ensure_stock_prints(voices, tts_fn=None):
         if not vid:
             continue
         npy_path = os.path.join(_CACHE_DIR, f'{vid}.npy')
-        if os.path.isfile(npy_path) and meta.get('kind') == _EMBED_KIND:
+        if os.path.isfile(npy_path) and meta.get('kind') == active_kind:
             try:
                 prints[vid] = np.load(npy_path)
                 continue
@@ -488,7 +489,7 @@ def ensure_stock_prints(voices, tts_fn=None):
             prints[vid] = vec
             rebuilt = True
     if rebuilt:
-        meta['kind'] = _EMBED_KIND if (_ge2e_encoder is not None and not _ge2e_failed) else 'mfcc'
+        meta['kind'] = active_kind
         meta['ids'] = sorted(prints)
         _save_meta(meta)
     logger.info(f'聲線庫已就緒（{len(prints)} 條，{meta.get("kind") or "mfcc"}）')

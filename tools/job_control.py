@@ -16,12 +16,11 @@ def start_job():
     global _CURRENT, _PENDING_STOP
     event = threading.Event()
     with _LOCK:
-        previous = _CURRENT
+        if _LIVE:
+            raise RuntimeError('上一個任務仍在處理或中止收尾，請待它結束後再開始。')
         _CURRENT = event
         _LIVE.add(event)
         _PENDING_STOP = False
-    if previous is not None:
-        previous.set()
     bind_job(event)
     return event
 
@@ -48,6 +47,8 @@ def finish_job(event=None):
             _CURRENT = None
         if not _LIVE:
             _PENDING_STOP = False
+    if getattr(_TLS, 'event', None) is event:
+        bind_job(None)
 
 
 def request_stop():

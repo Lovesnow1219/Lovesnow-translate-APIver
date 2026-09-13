@@ -16,7 +16,7 @@ from tools.target_language import is_asr_junk
 
 REPAIR_NAME = 'asr_repair.json'
 SOURCE_BIBLE_NAME = 'source_bible.json'
-REPAIR_VERSION = 4
+REPAIR_VERSION = 5
 _BATCH = 36
 _OVERLAP = 4
 _AUDIT_BATCH = 200
@@ -27,14 +27,6 @@ _MAX_NEW_SPEAKERS = 4
 _HAN_RE = re.compile(r'[\u4e00-\u9fff]')
 _HAN_KEEP = re.compile(r'[^\w\u4e00-\u9fff]+', flags=re.UNICODE)
 _SPEAKER_ID_RE = re.compile(r'^SPEAKER_[A-Z][A-Z0-9]{0,3}$')
-_REALM_RIVER_FIXES = (
-    (re.compile(r'(寻常|尋常|平常|普通)河道'), r'\1合道'),
-    (re.compile(r'河道(?=\s*[巔巅]?峰)'), '合道'),
-    (re.compile(r'河道(?=\s*强者)'), '合道'),
-    (re.compile(r'河道(?=\s*期)'), '合道'),
-    (re.compile(r'河道(?=\s*境)'), '合道'),
-    (re.compile(r'河道(?=\s*大成)'), '合道'),
-)
 
 
 def repair_path(folder):
@@ -46,6 +38,9 @@ def source_bible_path(folder):
 
 
 def already_repaired(folder):
+    from tools.source_subtitles import pending
+    if pending(folder):
+        return False
     path = repair_path(folder)
     if not os.path.isfile(path):
         return False
@@ -72,19 +67,7 @@ def ensure_repaired_transcript(folder, transcript=None, method='OpenAI', progres
     if not isinstance(transcript, list) or not transcript:
         return transcript
     if not force and already_repaired(folder):
-        from tools.line_roles import reassign_addressed_you_lines
-        moved = reassign_addressed_you_lines(transcript)
-        homophones = apply_realm_homophone_fixes(transcript)
-        if moved or homophones:
-            os.makedirs(folder, exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as handle:
-                json.dump(transcript, handle, indent=4, ensure_ascii=False)
-            if moved:
-                logger.info(f'語意講者規則改了 {moved} 句：{folder}')
-            if homophones:
-                logger.info(f'境界近音河道改回合道 {homophones} 句：{folder}')
-        else:
-            logger.info(f'辨識後修稿已做過，略過：{folder}')
+        logger.info(f'辨識後修稿已做過，略過：{folder}')
         return transcript
     return repair_asr_script(
         folder, transcript, method=method, progress_callback=progress_callback,
@@ -99,6 +82,8 @@ def repair_asr_script(folder, transcript, method='OpenAI', progress_callback=Non
     lines = [dict(item) for item in (transcript or [])]
     if not lines:
         return lines
+    from tools.source_subtitles import review_source_subtitles
+    lines = review_source_subtitles(folder, lines)
     from tools.line_roles import promote_bgm_speech
     rescued = promote_bgm_speech(lines)
     if rescued:
@@ -175,6 +160,8 @@ def ensure_source_bible(folder, transcript, method='OpenAI'):
     from tools.translation_bible import _load_folder_info, build_dubbing_bible
 
     info = _load_folder_info(folder)
+    from tools.dubbing_settings import style_note
+    info['dubbing_style'] = style_note(folder)
     bible = build_dubbing_bible(info, transcript, '简体中文', method)
     if not bible:
         return {}
@@ -202,11 +189,12 @@ def _progress(progress_callback, message):
 
 
 def fix_realm_homophones(text):
-    """合道 heard as 河道 next to a realm word is a realm, not a river."""
-    out = text or ''
-    for pattern, repl in _REALM_RIVER_FIXES:
-        out = pattern.sub(repl, out)
-    return out
+    """Compatibility helper: ambiguity belongs to context-aware ASR review.
+
+    A word such as 河道 may be a real river. Never silently rewrite it from
+    a cultivation-specific word list shared by every episode.
+    """
+    return text or ''
 
 
 def apply_realm_homophone_fixes(transcript):
@@ -358,6 +346,8 @@ def _format_card(index, line):
         f'#{index} {line.get("speaker") or ""} '
         f'{_card_t0(line):.2f}-{_card_t1(line):.2f} | '
         f'{(line.get("text") or "").strip()}'
+        + (f' | Visible source captions: {json.dumps(line["source_subtitle_evidence"], ensure_ascii=False)}'
+           if line.get('source_subtitle_evidence') else '')
     )
 
 
@@ -429,7 +419,7 @@ def _apply_speaker_item(transcript, item, allowed_speakers, created):
     return moved
 
 
-def _speaker_audit(transcript, bible, method, allowed_speakers, created, progress_callback=None):
+def _speaker_audit(transcript, bible, method, allowed_speakers, created, progress_callback=None, folder=None):
     from tools.job_control import check_stop
     from tools.translation_backends import llm_translate
     from tools.translation_bible import bible_context
@@ -486,6 +476,8 @@ def _speaker_audit(transcript, bible, method, allowed_speakers, created, progres
     for item in fixes:
         by_index[int(item['index'])] = item
     items = list(by_index.values())[:_MAX_AUDIT_FIXES]
+    from tools.source_validation import validate_source_repairs
+    items = validate_source_repairs(folder, transcript, items, method, 'speaker_audit')
     moved = 0
     for item in items:
         moved += _apply_speaker_item(transcript, item, allowed_speakers, created)
@@ -499,6 +491,7 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
     from tools.translation_backends import llm_translate
     from tools.translation_bible import bible_context
     from tools.translation_review import _join_lines, _merge_span
+    from tools.source_subtitles import preserves_caption_terms
 
     context = _context_blob(bible, transcript)
     outline = bible_context(bible) or '(no outline yet)'
@@ -507,8 +500,14 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
     system = (
         'You repair Chinese ASR subtitle cards before they are translated. '
         'You have an episode outline written from these cards. '
+        'That outline is provisional and is NOT independent evidence for uncertain words. '
+        'Visible source captions, when provided, are direct evidence from this video. '
+        'Preserve their spelling and facts over guesses in the ASR-derived outline. '
+        'Caption quotes are in chronological order. Use complete displayed utterances '
+        'to recover sentence and question/answer boundaries. Do not move a name or '
+        'vocative across those boundaries merely to make the ASR outline consistent. '
         'Fix misheard words when the outline and nearby cards make the intended word clear. '
-        'Cultivation realm homophones (合道 heard as 河道) go back to the realm word, not a river. '
+        'Resolve homophones only when the current episode context supports the correction; otherwise preserve the source. '
         'Join consecutive SAME-speaker cards that are one spoken sentence. '
         'Set skip=true only for sung lyrics or unintelligible noise. Leave those cards empty. '
         'Keep speech that sits in the music bed: opening TV, livestream ads, recap, narrator. '
@@ -532,7 +531,7 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         allowed = set(range(start, end))
         _progress(progress_callback, f'辨識後修稿 {batch_i}/{batches}（卡片 {start}–{end - 1}）…')
         payload = [
-            'Chinese ASR cards. Repair against the outline. Do not invent plot.',
+            'Chinese ASR cards. Prioritize visible captions and nearby source over provisional outline guesses. Do not invent plot.',
             outline,
             '',
         ]
@@ -548,6 +547,8 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         )
         fixes.extend(_parse_fixes(raw, allowed))
 
+    from tools.source_validation import validate_source_repairs
+    fixes = validate_source_repairs(folder, transcript, fixes, method, 'asr_repair')
     from tools.line_roles import SPEAKER_NARR, SPEAKER_SYS
     allowed_speakers = set(_known_speakers(transcript))
     allowed_speakers.update({SPEAKER_SYS, SPEAKER_NARR})
@@ -576,12 +577,17 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         if new_spk:
             moved_n += _apply_speaker_item(transcript, item, allowed_speakers, created)
         new_text = str(item.get('text') or item.get('suggest_source') or '').strip()
-        if new_text and _rewrite_ok(src, new_text, context, _duration(line)):
-            line['text'] = new_text
-            changed += 1
         span = _merge_span(item)
         if span:
+            # The proposed text covers the whole span. Apply it only together
+            # with a legal merge; otherwise the following card would be spoken
+            # twice while the host still has its original, shorter time slot.
             merges.append((span[0], span[1], new_text))
+            continue
+        if (new_text and preserves_caption_terms(line, new_text)
+                and _rewrite_ok(src, new_text, context, _duration(line))):
+            line['text'] = new_text
+            changed += 1
 
     blocked = set()
     deleted = []
@@ -593,11 +599,21 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
         glued = transcript[host].get('text') or ''
         for index in absorbed:
             glued = _glue_source(glued, transcript[index].get('text') or '')
-        source = suggest_source if suggest_source and _rewrite_ok(glued, suggest_source, context, 99) else ''
+        members = [transcript[index] for index in [host, *absorbed]]
+        source = suggest_source if (suggest_source
+            and all(preserves_caption_terms(member, suggest_source) for member in members)
+            and _rewrite_ok(glued, suggest_source, context, 99)) else ''
+        evidence = list(dict.fromkeys(quote for member in members
+                                      for quote in member.get('source_subtitle_evidence', [])))
+        terms = list(dict.fromkeys(term for member in members
+                                   for term in member.get('source_subtitle_terms', [])))
         _join_lines(transcript, host, absorbed, '', source or None)
         if not source:
             transcript[host]['text'] = glued
         transcript[host].pop('translation', None)
+        if evidence:
+            transcript[host]['source_subtitle_evidence'] = evidence
+            transcript[host]['source_subtitle_terms'] = terms
         blocked.add(host)
         blocked.update(absorbed)
         deleted.extend(absorbed)
@@ -607,13 +623,9 @@ def _ai_repair(folder, transcript, bible, method, progress_callback=None):
             del transcript[index]
     try:
         audit_n, created, transcript = _speaker_audit(
-            transcript, bible, method, allowed_speakers, created, progress_callback,
+            transcript, bible, method, allowed_speakers, created, progress_callback, folder=folder,
         )
         moved_n += audit_n
     except Exception as exc:
-        if isinstance(exc, JobStopped):
-            raise
         logger.warning(f'講者語意覆核失敗，沿用分批修稿：{exc}')
-    from tools.line_roles import reassign_addressed_you_lines
-    moved_n += reassign_addressed_you_lines(transcript)
     return changed, skip_n, merge_n, moved_n, created, transcript

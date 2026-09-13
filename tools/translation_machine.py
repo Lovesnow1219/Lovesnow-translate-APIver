@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 import json
 import os
-import translators as ts
 from dotenv import load_dotenv
 from loguru import logger
 load_dotenv()
 
 def translator_response(messages, to_language = 'zh-CN', translator_server = 'bing'):
+    # This package probes translation websites on import. Keep startup and
+    # OpenAI-only runs offline until the fallback is actually requested.
+    import translators as ts
     from tools.target_language import translator_code
     mapped = translator_code(to_language)
     if mapped:

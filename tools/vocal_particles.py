@@ -168,6 +168,13 @@ def collapse_double_particle_lead(trans, target_language='English'):
 
 def particle_lead_in(text, target_language='English'):
     """Comma lead for a host line that already starts with 嗯/呵/哼. Empty for particle-only."""
+    compact = ''.join(ch for ch in (text or '') if ch.strip() and ch not in '，,。！？!?、…')
+    repeated_particle = (compact and len(set(compact)) == 1
+                         and (_is_particle_text(compact[0]) or _is_particle_text(compact[0] * 2)))
+    if is_particle_card(text) or repeated_particle:
+        # A standalone interjection already has a complete translation. Adding
+        # another lead here undoes reviewed spellings and duplicates the sound.
+        return ''
     glyph = _source_lead_glyph(text)
     if not glyph:
         return ''

@@ -301,13 +301,9 @@ def redub_speakers(folder, language, table=None):
     activate_language(folder, language)
     if speaker_changed:
         clear_tts_cache(folder)
-    from tools.translation import tighten_overlong_lines
-    from tools.translation_review import applied_review_indices
-    applied_idx = applied_review_indices(folder, language)
-    if applied_idx:
-        tighten_overlong_lines(folder, language, indices=applied_idx, slack=2)
+    # Redub the saved wording; measured timing repairs use the reviewed path.
     tts_lang = tts_language(language)
-    result = generate_wavs('Fish', folder, tts_lang)
+    result = generate_wavs('Fish', folder, language)
     if isinstance(result, str):
         return f'{message}\n配音失敗：{result}', None, None
     wav_combined, _wav_ori = result
@@ -333,7 +329,7 @@ def retranslate_from_bible(folder, language, title=None, plot=None, outline=None
         bible_status = f'使用已儲存的大綱：{folder}'
     trans_lang, tts_lang = split_target_language(language)
     refresh_translation_lines(folder, trans_lang)
-    result = generate_wavs('Fish', folder, tts_lang)
+    result = generate_wavs('Fish', folder, language)
     if isinstance(result, str):
         return f'{bible_status}\n依大綱重翻後配音失敗：{result}', None, None
     wav_combined, _wav_ori = result

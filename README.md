@@ -131,3 +131,17 @@ Each episode lives in `videos/<title>/`. Plot notes stay in that folder’s `sou
 ## License
 
 See `NOTICE`. This tree is the cloud-API fork of Lovesnow-translate.
+
+## Stable delivery and timeline diagnostics
+
+The UI separates **fixed TTS delivery speed** (default 1.00), **English translation word budget** (default 2.2 words/sec), and **whole-video playback speed**. Sentence length no longer silently changes the requested TTS speed. Long dialogue remains complete; only conservative near-silent edges are removed.
+
+Use the per-episode creative brief and editable `prompts/dubbing_style.md` for tone. Translation receives neighboring source dialogue even in parallel mode. Ambiguous meanings and character decisions should follow the current episode, not a global genre-specific replacement list.
+
+For videos with readable source-language captions, the optional caption-as-source check sends up to 48 sampled frames to the configured main review model. Visible dialogue captions take precedence over the spoken wording in meme edits. Corrections require a matching frame and quoted caption; whole-line replacements require two distinct frames. Evidence is saved in `source_subtitle_review.json`. Source changes rebuild dependent translations and audio. This is off by default and adds API usage. Sampling, caption errors, and model reading errors still require review; it is not a full-video OCR or lip-sync guarantee.
+
+The timeline tab shows each line's original and actual start, duration, and delay. Changing the brief or word budget affects new translations; select force retranslate to update existing text. Legacy WAVs without cache fingerprints are regenerated on the first upgraded dubbing run and may incur API charges. Later runs reuse validated matching audio.
+
+Choose top subtitle placement under video output to avoid baked-in captions at the bottom. Failed review calls or malformed responses are shown as incomplete, with no successful post-dub review stamp; a previewable movie does not imply review completion.
+
+See the [review and validation notes](docs/dubbing-review-2026-09.md), including the remaining live-provider and visual UI validation gaps. Run offline regression tests with `pip install -r requirements-dev.txt` and `python -m pytest -q tests` (FFmpeg and ffprobe required).

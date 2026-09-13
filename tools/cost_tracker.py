@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import threading
+import uuid
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -245,6 +246,7 @@ def format_duration(seconds):
 class CostSession:
     def __init__(self, folder=None):
         self.folder = folder
+        self.run_id = uuid.uuid4().hex
         self.entries = []
         self.percent = 0
         self.current_label = '準備中'
@@ -304,6 +306,16 @@ class CostSession:
         entry['usd'] = round(_price_entry(entry), 6)
         with self._lock:
             self.entries.append(entry)
+            if self.folder:
+                try:
+                    os.makedirs(self.folder, exist_ok=True)
+                    receipt = {**entry, 'run_id': self.run_id,
+                               'at': datetime.now(timezone.utc).isoformat()}
+                    with open(os.path.join(self.folder, 'api_usage.jsonl'), 'a', encoding='utf-8') as handle:
+                        handle.write(json.dumps(receipt, ensure_ascii=False) + '\n')
+                except (OSError, TypeError, ValueError) as exc:
+                    # A receipt failure must never trigger another paid request.
+                    logger.warning(f'API 用量明細無法寫入：{type(exc).__name__}')
         logger.info(f"成本 {provider}/{kind} {model}: ${entry['usd']:.4f}")
         self.notify(force=False)
 
@@ -369,6 +381,7 @@ class CostSession:
 
     def snapshot(self):
         return {
+            'run_id': self.run_id,
             'folder': self.folder,
             'at': datetime.now(timezone.utc).isoformat(),
             'currency': 'USD',
@@ -461,6 +474,21 @@ def last_cost_markdown():
     return _LAST_MARKDOWNS[-1]
 
 
+def credential_token_lines(entries):
+    totals = {}
+    for entry in entries:
+        if entry.get('provider') != 'openai':
+            continue
+        label = entry.get('credential') or '未標記（舊紀錄）'
+        tokens = int(entry.get('input_tokens') or 0) + int(entry.get('output_tokens') or 0)
+        totals[label] = totals.get(label, 0) + tokens
+    if not totals:
+        return []
+    return ['', 'OpenAI 本趟用量（輸入＋輸出 tokens，含推理）：'] + [
+        f'- {label}：{tokens:,}' for label, tokens in sorted(totals.items())
+    ] + ['此處是本趟回報用量；每日剩餘額度與免費模型資格請以帳號後台為準。']
+
+
 def clear_last_markdowns():
     _LAST_MARKDOWNS.clear()
 
@@ -510,6 +538,7 @@ def live_status_text(percent=None, stage=None, session=None):
             lines.append(_detail_line(provider, kind, model, item))
     else:
         lines.append('（尚無 API 花費，開始打 API 後會即時更新）')
+    lines.extend(credential_token_lines(session.entries if session else []))
     lines.append('')
     lines.extend(_used_rate_footer(session.entries if session else []))
     return '\n'.join(lines)
@@ -540,6 +569,7 @@ def live_cost_markdown():
         for (provider, kind, model), item in grouped.items():
             lines.append(_detail_line(provider, kind, model, item))
     lines.append('')
+    lines.extend(credential_token_lines(session.entries))
     lines.extend(_used_rate_footer(session.entries))
     return '\n'.join(lines)
 
@@ -659,6 +689,7 @@ def format_snapshot(folder, history):
         for (provider, kind, model), item in grouped.items():
             lines.append(_detail_line(provider, kind, model, item))
     lines.append('')
+    lines.extend(credential_token_lines(last_entries))
     lines.extend(_used_rate_footer(last_entries))
     return '\n'.join(lines)
 

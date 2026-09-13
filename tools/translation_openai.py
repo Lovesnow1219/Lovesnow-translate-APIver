@@ -19,8 +19,29 @@ def _extract_output_text(response):
     return ''
 
 
+def _chat_messages(messages):
+    """Preserve image inputs when using the Chat Completions compatibility path."""
+    result = []
+    for message in messages:
+        row = dict(message)
+        if isinstance(row.get('content'), list):
+            blocks = []
+            for part in row['content']:
+                if part.get('type') == 'input_text':
+                    blocks.append({'type': 'text', 'text': part['text']})
+                elif part.get('type') == 'input_image':
+                    blocks.append({'type': 'image_url', 'image_url': {
+                        'url': part['image_url'], 'detail': part.get('detail', 'auto')}})
+                else:
+                    blocks.append(part)
+            row['content'] = blocks
+        result.append(row)
+    return result
+
+
 def _call_openai(api_key, n_keys, index, messages, reasoning_effort=None, timeout=None, model=None, purpose='translate'):
-    from tools.api_keys import is_quota_error
+    from tools.api_keys import is_quota_error, openai_key_label
+    from tools.cost_tracker import record
 
     model_name = (model or os.getenv('MODEL_NAME') or 'gpt-5.6-luna').strip()
     base_url = os.getenv('OPENAI_API_BASE') or 'https://api.openai.com/v1'
@@ -52,20 +73,23 @@ def _call_openai(api_key, n_keys, index, messages, reasoning_effort=None, timeou
             kwargs['reasoning'] = {'effort': effort}
         try:
             response = client.responses.create(**kwargs)
+            # Even an empty / reasoning-only response may consume tokens.
+            record('openai', kind, model_name, response=response,
+                   credential=openai_key_label(api_key))
             text = _extract_output_text(response)
             if text:
-                from tools.cost_tracker import record
-                record('openai', kind, model_name, response=response)
                 return text
             logger.warning('Responses API 沒有回文字，改走 Chat Completions')
         except Exception as exc:
-            if is_quota_error(exc):
+            # A timeout can occur after generation was billed. Only fall back
+            # when the endpoint explicitly reports protocol incompatibility.
+            if is_quota_error(exc) or getattr(exc, 'status_code', None) not in (400, 404, 405, 422, 501):
                 raise
             logger.warning(f'Responses API 失敗，改走 Chat Completions: {exc}')
 
     kwargs = {
         'model': model_name,
-        'messages': messages,
+        'messages': _chat_messages(messages),
         'timeout': timeout,
     }
     extra_body = {}
@@ -76,8 +100,8 @@ def _call_openai(api_key, n_keys, index, messages, reasoning_effort=None, timeou
     if extra_body:
         kwargs['extra_body'] = extra_body
     response = client.chat.completions.create(**kwargs)
-    from tools.cost_tracker import record
-    record('openai', kind, model_name, response=response)
+    record('openai', kind, model_name, response=response,
+           credential=openai_key_label(api_key))
     return response.choices[0].message.content
 
 

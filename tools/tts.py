@@ -1,7 +1,6 @@
 from collections import Counter
 import json
 import os
-import re
 
 import librosa
 from loguru import logger
@@ -13,7 +12,6 @@ from .tts_fish import (
     apply_emotion_tags,
     assign_speaker_voices,
     fish_clone_pending,
-    spoken_text_for_timing,
     reassign_crossed_pitch_speakers,
     split_mixed_pitch_speakers,
     voice_for_method,
@@ -33,6 +31,9 @@ tts_support_languages = {
 }
 
 def generate_wavs(method, folder, target_language='中文', voice=None):
+    from tools.dubbing_settings import load_delivery_settings, stamp_render
+    from tools.dubbing_timing import write_timing_report
+    delivery = load_delivery_settings(folder)
     method = method or 'Fish'
     if method != 'Fish':
         raise ValueError('目前只支援 Fish 配音')
@@ -47,6 +48,8 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
         os.makedirs(output_folder)
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript = json.load(f)
+    from tools.asr import ensure_speaker_audio
+    ensure_speaker_audio(folder, transcript)
     from tools.vocal_particles import (
         ensure_particle_translation_lead,
         is_particle_card,
@@ -68,7 +71,7 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
         ensure_particle_translation_lead(line, target_language)
     from tools.translation import repair_shared_orig_windows
     transcript = repair_shared_orig_windows(transcript)
-    from tools.target_language import speakers_are_locked, spoken_char_pace, spoken_word_pace, uses_char_budget
+    from tools.target_language import speakers_are_locked
     split_now = False
     from tools.asr_repair import already_repaired
     if not speakers_are_locked(folder) and not already_repaired(folder):
@@ -93,9 +96,9 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
     num_speakers = len(speakers)
     logger.info(f'Found {num_speakers} speakers')
 
-    if target_language not in tts_support_languages[method]:
+    if tts_language(target_language) not in tts_support_languages[method]:
         logger.error(f'{method} does not support {target_language}')
-        return f'{method} does not support {target_language}'
+        raise ValueError(f'{method} does not support {target_language}')
 
     voices, cloned_now = assign_speaker_voices(
         folder, transcript, target_language, clone=True,
@@ -106,6 +109,8 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
         clear_tts_cache(folder)
         os.makedirs(output_folder, exist_ok=True)
     from tools.line_roles import should_skip_dub
+    from tools.source_vocalizations import preserve_laughter
+    source_vocals = _load_vocals(folder)
 
     def _line_job(i, line):
         speaker = line['speaker']
@@ -114,6 +119,10 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
             text = preprocess_text(line.get('text') or '', target_language)
         source_text = line.get('text') or ''
         output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
+        if not should_skip_dub(line) and preserve_laughter(folder, line, output_path, source_vocals):
+            logger.info(f'保留原片純笑聲與時長：#{i}')
+            return None
+        line.pop('audio_source', None)
         if is_asr_junk(source_text) or should_skip_dub(line) or not (text or '').strip():
             silence = np.zeros((max(8, int(0.08 * 24000)),), dtype=np.float32)
             save_wav(silence, output_path)
@@ -131,17 +140,9 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
             logger.info(f'情绪配音: {emotion_shown}')
         speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
         speaker_voice = voice_for_method(voices, speaker, method, ui_voice=voice)
-        slot = float(line.get('orig_end') or line.get('end') or 0) - float(line.get('orig_start') or line.get('start') or 0)
-        spoken = spoken_text_for_timing(tts_text)
-        tts_speed = 1.0
-        if uses_char_budget(target_language):
-            units = max(1, len(re.sub(r'\s+', '', spoken)))
-            pace = max(3.0, spoken_char_pace(target_language))
-        else:
-            units = max(1, len(spoken.split()))
-            pace = max(1.2, spoken_word_pace(target_language))
-        if slot > 0.25 and units / pace > slot * 1.08:
-            tts_speed = float(min(1.12, (units / pace) / slot))
+        # One deliberate speed for the whole episode; never accelerate each
+        # sentence from a word-count estimate and then delay it again.
+        tts_speed = delivery['tts_speed']
         return {
             'i': i,
             'line': line,
@@ -161,9 +162,7 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
 
     def _synth(job):
         output_path = job['output_path']
-        text = job['text']
         tts_text = job['tts_text']
-        speaker_wav = job['speaker_wav']
         tts_speed = job['tts_speed']
         speaker_voice = job['speaker_voice']
         fish_tts(tts_text, output_path, target_language=target_language, voice=speaker_voice, speed=tts_speed)
@@ -177,30 +176,18 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
     map_parallel(_synth, jobs, workers)
 
     from tools.job_control import check_stop
-    from tools.translation import tighten_overlong_lines
     from tools.translation_versions import write_translation
     write_translation(folder, transcript, target_language)
     check_stop()
-    _summary, transcript = tighten_overlong_lines(
-        folder, target_language, slack=100, ignore_wav_stale=True,
-    )
-    redo = []
-    for i, line in enumerate(transcript):
-        output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
-        if os.path.isfile(output_path):
-            continue
-        job = _line_job(i, line)
-        if job:
-            redo.append(job)
-    if redo:
-        logger.info(f'音檔仍超槽，已收緊並重合成 {len(redo)} 句')
-        map_parallel(_synth, redo, workers)
+    # Measure approved dialogue as spoken. Timing repairs go through the main
+    # reviewer below, never an unreviewed word-budget rewrite after approval.
 
     wav_paths = [
         os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
         for i in range(len(transcript))
     ]
     full_wav = assemble_dub_timeline(transcript, wav_paths, vocals=_load_vocals(folder))
+    write_timing_report(folder, transcript)
     save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'))
     write_translation(folder, transcript, target_language)
 
@@ -231,6 +218,7 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
                 for i in range(len(transcript))
             ]
             full_wav = assemble_dub_timeline(transcript, wav_paths, vocals=_load_vocals(folder))
+            write_timing_report(folder, transcript)
             save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'))
             write_translation(folder, transcript, target_language)
             instruments_wav, sr = librosa.load(os.path.join(folder, 'audio_instruments.wav'), sr=24000)
@@ -238,9 +226,11 @@ def generate_wavs(method, folder, target_language='中文', voice=None):
             logger.info(f'配音後審稿已重混: {os.path.join(folder, "audio_combined.wav")}')
             stamp_after_dub(folder, target_language)
 
+    stamp_render(folder, target_language, voice)
     return os.path.join(folder, 'audio_combined.wav'), os.path.join(folder, 'audio.wav')
 
-def generate_all_wavs_under_folder(root_folder, method='Fish', target_language='中文', voice=None):
+def generate_all_wavs_under_folder(root_folder, method='Fish', target_language='中文', voice=None, tts_speed=None):
+    from tools.dubbing_settings import save_delivery_settings, stamp_render
     from tools.target_language import clear_tts_cache, layout_cache_ok, mix_cache_ok, tts_cache_ok
     wav_combined, wav_ori = None, None
     from tools.translation_versions import activate_language, has_any_version, has_version, snapshot_active
@@ -253,6 +243,8 @@ def generate_all_wavs_under_folder(root_folder, method='Fish', target_language='
             logger.info(f'沒有 {target_language} 譯文，略過配音：{root}')
             continue
         activate_language(root, target_language)
+        if tts_speed is not None:
+            save_delivery_settings(root, tts_speed)
         files = os.listdir(root)
         clone_pending = False
         if method == 'Fish':
@@ -262,11 +254,9 @@ def generate_all_wavs_under_folder(root_folder, method='Fish', target_language='
         if clone_pending:
             logger.info(f'尚未鎖定角色聲線，將重新合成 {root}')
             clear_tts_cache(root)
-        elif not tts_cache_ok(root, target_language):
-            if 'audio_combined.wav' in files:
-                logger.info(f'目標語言改為 {target_language}，清除舊配音後重合成')
-                clear_tts_cache(root)
-        if tts_cache_ok(root, target_language) and not clone_pending:
+        # A changed input invalidates the mix, but matching per-line WAVs can
+        # still be reused. Fish validates each line's request fingerprint.
+        if tts_cache_ok(root, target_language, voice) and not clone_pending:
             if layout_cache_ok(root) and mix_cache_ok(root):
                 wav_combined, wav_ori = os.path.join(root, 'audio_combined.wav'), os.path.join(root, 'audio.wav')
                 logger.info(f'Wavs already generated in {root}')
@@ -278,6 +268,8 @@ def generate_all_wavs_under_folder(root_folder, method='Fish', target_language='
                 wav_combined, wav_ori = generate_wavs(method, root, target_language, voice)
         else:
             wav_combined, wav_ori = generate_wavs(method, root, target_language, voice)
+        if wav_combined:
+            stamp_render(root, target_language, voice)
     return f'Generated all wavs under {root_folder}', wav_combined, wav_ori
 
 if __name__ == '__main__':

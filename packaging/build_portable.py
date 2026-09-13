@@ -58,6 +58,8 @@ def copy_project(dest):
         return [name for name in names if name in skip or name.endswith('.pyc')]
 
     shutil.copytree(ROOT / 'tools', dest / 'tools', dirs_exist_ok=True, ignore=ignore)
+    if (ROOT / 'prompts').is_dir():
+        shutil.copytree(ROOT / 'prompts', dest / 'prompts', dirs_exist_ok=True, ignore=ignore)
     if (ROOT / 'assets').is_dir():
         shutil.copytree(ROOT / 'assets', dest / 'assets', dirs_exist_ok=True, ignore=ignore)
     if (ROOT / 'font').is_dir():

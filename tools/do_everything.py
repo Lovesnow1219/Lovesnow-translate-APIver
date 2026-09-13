@@ -148,7 +148,8 @@ def process_video(info, root_folder, resolution,
                   subtitles, speed_up, fps, background_music, bgm_volume, video_volume,
                   target_resolution, max_retries, progress_callback=None,
                   force_retranslate=False, force_redub=False,
-                  source_language='中文'):
+                  source_language='中文', tts_speed=None, style_note=None, source_subtitles=None,
+                  subtitle_position='bottom'):
     """
     處理單個影片的完整流程，增加了進度回呼函式
 
@@ -203,7 +204,12 @@ def process_video(info, root_folder, resolution,
 
                 logger.info(f'處理影片: {folder}')
                 begin_session(folder)
-                if force_retranslate:
+                from tools.source_subtitles import set_enabled
+                set_enabled(folder, source_subtitles)
+                if style_note is not None:
+                    from tools.dubbing_settings import save_style_note
+                    save_style_note(folder, style_note)
+                if force_retranslate and retry == 0:
                     from tools.target_language import clear_translation_cache
                     keep_bible = False
                     summary_path = os.path.join(folder, 'summary.json')
@@ -215,7 +221,7 @@ def process_video(info, root_folder, resolution,
                             keep_bible = False
                     logger.info(f'強制重翻：{folder} keep_bible={keep_bible} language={translation_target_language}')
                     clear_translation_cache(folder, keep_bible=keep_bible, language=translation_target_language)
-                elif force_redub:
+                elif force_redub and retry == 0:
                     from tools.target_language import clear_tts_cache
                     logger.info(f'強制重配：{folder}')
                     clear_tts_cache(folder)
@@ -290,7 +296,9 @@ def process_video(info, root_folder, resolution,
 
                 try:
                     status, synth_path, _ = generate_all_wavs_under_folder(
-                        folder, method=tts_method, target_language=tts_target_language, voice=voice)
+                        folder, method=tts_method, target_language=translation_target_language, voice=voice, tts_speed=tts_speed)
+                    if not synth_path or not os.path.isfile(synth_path):
+                        raise RuntimeError('未產生配音音訊')
                     logger.info(f'語音合成完成: {synth_path}')
                 except JobStopped:
                     raise
@@ -310,7 +318,10 @@ def process_video(info, root_folder, resolution,
                 try:
                     status, output_video = synthesize_all_video_under_folder(
                         folder, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=target_resolution,
-                        background_music=background_music, bgm_volume=bgm_volume, video_volume=video_volume)
+                        background_music=background_music, bgm_volume=bgm_volume, video_volume=video_volume,
+                        subtitle_position=subtitle_position)
+                    if not output_video or not os.path.isfile(output_video):
+                        raise RuntimeError('未產生成片')
                     logger.info(f'影片合成完成: {output_video}')
                 except JobStopped:
                     raise
@@ -321,9 +332,13 @@ def process_video(info, root_folder, resolution,
                     return False, None, error_msg
 
                 # 完成所有階段，回報100%進度
-                mark_stage("處理完成!", 100)
+                from tools.dubbing_timing import load_timing_ui
+                timing_status, _ = load_timing_ui(folder)
+                from tools.review_state import warning
+                incomplete = warning(folder, translation_target_language)
+                mark_stage((incomplete or '處理完成！ ') + timing_status.split('\n')[0], 100)
 
-                return True, output_video, "處理成功"
+                return True, output_video, '處理成功；' + timing_status.split('\n')[0]
             except JobStopped:
                 raise
             except Exception as e:
@@ -357,7 +372,8 @@ def do_everything(root_folder, url, resolution='1080p',
                   force_retranslate=False, force_redub=False,
                   translation_model=None, translation_effort=None,
                   review_model=None, review_effort=None,
-                  source_language='中文'):
+                  source_language='中文', tts_speed=None, style_note=None, source_subtitles=None,
+                  subtitle_position='bottom'):
     """
     處理整個影片處理流程，增加了進度回呼函式
 
@@ -381,13 +397,18 @@ def do_everything(root_folder, url, resolution='1080p',
             os.environ['DUBBING_WORDS_PER_SEC'] = str(float(words_per_sec))
         except (TypeError, ValueError):
             pass
-    if translate_workers not in (None, '', False):
+    if translate_workers not in (None, ''):
         try:
             os.environ['TRANSLATE_WORKERS'] = str(max(0, int(float(translate_workers))))
         except (TypeError, ValueError):
             pass
 
     def _done(status, video):
+        if video:
+            from tools.review_state import warning
+            incomplete = warning(os.path.dirname(video), translation_target_language)
+            if incomplete:
+                status += '\n' + incomplete
         md = last_cost_markdown()
         if md and '尚無成本資料' not in md:
             status = f'{status}\n\n{md}'
@@ -431,7 +452,8 @@ def do_everything(root_folder, url, resolution='1080p',
                 subtitles, speed_up, fps, background_music, bgm_volume, video_volume,
                 target_resolution, max_retries, progress_callback,
                 force_retranslate=force_retranslate, force_redub=force_redub,
-                source_language=source_language,
+                source_language=source_language, tts_speed=tts_speed, style_note=style_note,
+                source_subtitles=source_subtitles, subtitle_position=subtitle_position,
             )
 
         # 初始化模型（改用新的初始化函式）
@@ -589,6 +611,10 @@ def stream_do_everything(root_folder, url, *args, local_file=None, **kwargs):
     except GeneratorExit:
         request_stop()
         raise
+    finally:
+        # Gradio may reuse the generator's thread for a standalone operation.
+        # Do not leave that thread bound to a cancelled event.
+        bind_job(None)
 
 
 if __name__ == '__main__':

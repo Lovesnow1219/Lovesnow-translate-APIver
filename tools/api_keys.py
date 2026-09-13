@@ -85,6 +85,18 @@ def _key_tag(key):
     return f'...{text[-4:]}' if len(text) >= 4 else '?'
 
 
+def openai_key_label(key):
+    """Identify the configured credential without storing any part of the secret."""
+    names = ('OPENAI_API_KEY', 'OPENAI_API_KEY_2', 'OPENAI_API_KEY_3',
+             'OPENAI_TRANSLATE_API_KEY', 'OPENAI_TRANSLATE_API_KEY_2',
+             'OPENAI_LUNA_API_KEY')
+    for name in names:
+        for index, candidate in enumerate(split_api_keys(os.getenv(name)), start=1):
+            if candidate == key:
+                return name if index == 1 else f'{name}[{index}]'
+    return 'unlabelled'
+
+
 def is_quota_error(exc):
     code = getattr(exc, 'code', None)
     if isinstance(code, str) and code.lower() in {
@@ -138,7 +150,9 @@ def next_api_key(*env_names, error='', expand=True):
     keys = require_api_keys(*env_names, error=error, expand=expand)
     with _LOCK:
         live = [key for key in keys if key not in _DEAD]
-        pool = live or keys
+        if not live:
+            raise RuntimeError('所有已設定的 API key 均已停用；請更新金鑰，或確認額度恢復後重啟程式。')
+        pool = live
         slot = env_names[0]
         index = _COUNTERS.get(slot, 0)
         _COUNTERS[slot] = index + 1

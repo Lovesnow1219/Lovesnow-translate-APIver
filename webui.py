@@ -238,11 +238,17 @@ def _review_pick_update(folder, language=None, selected=None):
     return gr.update(choices=choices, value=kept)
 
 
+def _tts_speed():
+    return gr.Slider(minimum=0.85, maximum=1.15, step=0.01, value=1.0,
+        label='配音語速（整片固定）',
+        info='建議 1.00。只調整人物說話速度，不改影片速度；不再按句子長度自動加速。')
+
+
 def do_everything_with_cost(
     root_folder, url, local_file, dl_res, shifts, source_lang, target_lang,
     translation_model, translation_effort, review_model, review_effort,
     subtitles, speed_up, fps, out_res, bgm, bgm_vol, video_vol,
-    words_per_sec, translate_workers, force_retranslate,
+    words_per_sec, translate_workers, force_retranslate, tts_speed, style_note, source_subtitles, subtitle_position,
 ):
     for status, video, cost_md in stream_do_everything(
         root_folder, url,
@@ -256,13 +262,25 @@ def do_everything_with_cost(
         translation_effort=translation_effort,
         review_model=review_model,
         review_effort=review_effort,
-        source_language=source_lang,
+        source_language=source_lang, tts_speed=tts_speed, style_note=style_note,
+        source_subtitles=source_subtitles, subtitle_position=subtitle_position,
     ):
         yield status, (gr.update() if video is None else video), cost_md
 
 
 def demucs_from_ui(folder, progress, shifts):
     return separate_all_audio_under_folder(folder, model_name=DEMUCS_METHOD, progress=progress, shifts=shifts)
+
+
+def _subtitle_position():
+    return gr.Dropdown(choices=[('下方', 'bottom'), ('上方（避開原片底部字幕）', 'top')],
+                       value='bottom', label='翻譯字幕位置')
+
+
+def synthesize_from_ui(folder, subtitles, speed, fps, resolution, bgm, bgm_volume, video_volume, subtitle_position):
+    return synthesize_all_video_under_folder(folder, subtitles=subtitles, speed_up=speed,
+        fps=fps, resolution=resolution, background_music=bgm, bgm_volume=bgm_volume,
+        video_volume=video_volume, subtitle_position=subtitle_position)
 
 
 def asr_from_ui(folder, source_language):
@@ -275,19 +293,19 @@ def translate_from_ui(folder, language, translation_model, translation_effort):
     return translate_all_transcript_under_folder(folder, TRANSLATE_METHOD, trans_lang)
 
 
-def tts_from_ui(folder, language):
-    _, tts_lang = split_target_language(language)
-    return generate_all_wavs_under_folder(folder, TTS_METHOD, tts_lang)
+def tts_from_ui(folder, language, tts_speed):
+    trans_lang, _ = split_target_language(language)
+    return generate_all_wavs_under_folder(folder, TTS_METHOD, trans_lang, tts_speed=tts_speed)
 
 
 def _bgm_fields(filepath=False):
     with gr.Accordion('背景音樂（可選，通常不必調）', open=False):
-        kwargs = {'label': '背景音樂', 'sources': ['upload']}
+        kwargs = {'label': '額外背景音樂', 'sources': ['upload'], 'type': 'filepath'}
         if filepath:
             kwargs['type'] = 'filepath'
         bgm = gr.Audio(**kwargs)
         bgm_vol = gr.Slider(minimum=0, maximum=1, step=0.05, label='背景音樂音量', value=0.5)
-        video_vol = gr.Slider(minimum=0, maximum=1, step=0.05, label='影片音量', value=1.0)
+        video_vol = gr.Slider(minimum=0, maximum=1, step=0.05, label='配音與原伴奏音量', value=1.0)
     return bgm, bgm_vol, video_vol
 
 
@@ -781,7 +799,8 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
                 dl_res = _resolution('下載解析度')
                 out_res = _resolution('輸出解析度')
                 subtitles = gr.Checkbox(label='加入字幕', value=True)
-                speed_up = gr.Slider(minimum=0.5, maximum=2, step=0.05, label='加速倍數', value=1.00)
+                subtitle_position = _subtitle_position()
+                speed_up = gr.Slider(minimum=0.5, maximum=2, step=0.05, label='整片播放倍率（畫面＋聲音）', value=1.00, info='通常維持 1.00；這會改變成片長度，與配音語速不同。')
                 fps = gr.Slider(minimum=1, maximum=60, step=1, label='幀率', value=30)
             bgm, bgm_vol, video_vol = _bgm_fields()
             force_retranslate = gr.Checkbox(
@@ -789,14 +808,21 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
                 value=False,
                 info='清掉譯文後重翻。若大綱已鎖定會沿用大綱。',
             )
-            with gr.Accordion('進階', open=True):
+            with gr.Accordion('配音節奏', open=True):
+                source_subtitles = gr.Checkbox(label='以原片字幕為翻譯依據', value=False,
+                    info='適合有清晰字幕的改梗動畫：配音與字幕不同時，以字幕為準。使用主審核 API，最多取樣 48 張畫面；會增加用量，原文修改後會重建譯文與配音。')
+                tts_speed = _tts_speed()
+                style_note = gr.Textbox(label='本片翻譯風格／需求（可自由修改）', lines=3,
+                    value='自然口語，保留吐槽、反轉、笑點與角色口吻。依本片情境處理梗和雙關，不擅自新增笑話或套用其他作品的設定。',
+                    info='隨本片保存。變更後若要套用到已有譯文，請勾「強制重翻」。')
+                gr.Markdown('沙雕動畫建議：固定語速 1.00、英文預算 2.2。保留吐槽、反轉與角色口吻；超長句先改寫，整句播完。')
                 words_per_sec = gr.Slider(
                     minimum=1.5,
-                    maximum=5.0,
+                    maximum=3.0,
                     step=0.1,
                     value=2.2,
-                    label='英文語速（每秒詞）',
-                    info='只影響英文譯文字數上限。越低越短、比較不會趕。Fish 英文約 2.2。',
+                    label='英文譯文字數預算（每秒詞）',
+                    info='建議 2.2，只影響新翻譯的字數。已有譯文需勾「強制重翻」；這不會直接調整聲音速度。',
                 )
                 translate_workers = gr.Slider(
                     minimum=0,
@@ -808,7 +834,7 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
                 )
 
             with gr.Row():
-                submit = gr.Button('Submit', variant='primary')
+                submit = gr.Button('開始翻譯與配音', variant='primary')
                 stop = gr.Button('中止', variant='stop')
         with gr.Column():
             status = gr.Textbox(label='合成狀態（即時進度與各步驟成本）', lines=16, max_lines=24, autoscroll=True)
@@ -817,7 +843,7 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
                 value='處理過程會在這裡更新各步驟估計費用。長內容可在此框內捲動。',
                 elem_id='live-cost-panel',
             )
-            result_video = gr.Video(label='合成影片範例結果')
+            result_video = gr.Video(label='本次合成影片')
 
     def stop_running_job():
         from tools.job_control import request_stop
@@ -832,7 +858,7 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
             review_model, review_effort,
             subtitles, speed_up, fps, out_res,
             bgm, bgm_vol, video_vol,
-            words_per_sec, translate_workers, force_retranslate,
+            words_per_sec, translate_workers, force_retranslate, tts_speed, style_note, source_subtitles, subtitle_position,
         ],
         outputs=[status, result_video, cost_md],
     )
@@ -840,7 +866,7 @@ with gr.Blocks(theme=my_theme, css=_UI_CSS) as full_auto_interface:
         fn=stop_running_job,
         inputs=None,
         outputs=[status],
-        cancels=[run_event],
+        queue=False,
     )
 
 
@@ -922,6 +948,7 @@ tts_interface = gr.Interface(
     ],
     additional_inputs=[
         _target_language(),
+        _tts_speed(),
     ],
     additional_inputs_accordion=_accordion('配音設定'),
     outputs=[
@@ -938,17 +965,18 @@ with gr.Blocks(theme=my_theme) as synthesize_video_interface:
             syn_folder = folder_picker('影片資料夾')
             with gr.Accordion('影片輸出', open=False):
                 syn_subtitles = gr.Checkbox(label='加入字幕', value=True)
-                syn_speed = gr.Slider(minimum=0.5, maximum=2, step=0.05, label='加速倍數', value=1.00)
+                syn_subtitle_position = _subtitle_position()
+                syn_speed = gr.Slider(minimum=0.5, maximum=2, step=0.05, label='整片播放倍率（畫面＋聲音）', value=1.00, info='通常維持 1.00；這會改變成片長度，與配音語速不同。')
                 syn_fps = gr.Slider(minimum=1, maximum=60, step=1, label='幀率', value=30)
                 syn_res = _resolution()
             syn_bgm, syn_bgm_vol, syn_video_vol = _bgm_fields(filepath=True)
-            syn_submit = gr.Button('Submit', variant='primary')
+            syn_submit = gr.Button('合成影片', variant='primary')
         with gr.Column():
             syn_status = gr.Text(label='合成狀態')
             syn_video = gr.Video(label='合成影片')
     syn_submit.click(
-        fn=synthesize_all_video_under_folder,
-        inputs=[syn_folder, syn_subtitles, syn_speed, syn_fps, syn_res, syn_bgm, syn_bgm_vol, syn_video_vol],
+        fn=synthesize_from_ui,
+        inputs=[syn_folder, syn_subtitles, syn_speed, syn_fps, syn_res, syn_bgm, syn_bgm_vol, syn_video_vol, syn_subtitle_position],
         outputs=[syn_status, syn_video],
     )
 
@@ -1403,6 +1431,19 @@ with gr.Blocks(theme=my_theme) as step_menu:
         with gr.Accordion(name, open=False):
             iface.render()
 
+from tools.dubbing_timing import load_timing_ui
+
+with gr.Blocks(theme=my_theme) as timing_interface:
+    gr.Markdown('配音時間軸檢查：找出延遲、超長句與多餘靜音。句號與講者對應「講者／譯文」中的編號。')
+    timing_folder = folder_picker('已配音影片資料夾')
+    timing_refresh = gr.Button('檢查配音時間軸', variant='primary')
+    timing_summary = gr.Markdown('請選擇已配音的影片。')
+    timing_table = gr.Dataframe(headers=['句號', '講者', '原片開始（秒）', '配音開始（秒）',
+        '原句時長（秒）', '配音時長（秒）', '延遲（秒）', '狀態', '譯文'],
+        datatype=['number', 'str', 'number', 'number', 'number', 'number', 'number', 'str', 'str'],
+        interactive=False, wrap=True)
+    timing_refresh.click(load_timing_ui, inputs=[timing_folder], outputs=[timing_summary, timing_table])
+
 app = gr.TabbedInterface(
     theme=my_theme,
     css=_UI_CSS,
@@ -1411,14 +1452,24 @@ app = gr.TabbedInterface(
         api_settings_interface,
         full_auto_interface,
         step_menu,
+        timing_interface,
     ],
     tab_names=[
         'API 設定',
         '一鍵自動化 One-Click',
         '分步操作',
+        '配音時間軸',
     ],
     title='Lovesnow-translate 影片AI配音／翻譯'
 )
+
+# Shared environment/model settings and episode files cannot be mutated by
+# different tabs at once. Stop stays unqueued; keep the generator alive until
+# its worker has finished so a cancelled API call cannot race a new run.
+for _event in app.fns.values():
+    if _event.fn is not stop_running_job:
+        _event.concurrency_id = 'dubbing-project'
+        _event.concurrency_limit = 1
 
 if __name__ == '__main__':
     import os
@@ -1429,7 +1480,7 @@ if __name__ == '__main__':
         _net.url_ok = lambda url: True
     except Exception:
         pass
-    app.queue(default_concurrency_limit=4)
+    app.queue(default_concurrency_limit=1)
     _assets = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
     app.launch(
         server_name="127.0.0.1",

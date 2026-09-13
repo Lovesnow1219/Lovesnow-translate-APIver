@@ -164,7 +164,7 @@ def _sync_source_speaker(folder, line, new_spk):
             json.dump(rows, handle, indent=4, ensure_ascii=False)
 
 
-def auto_apply_review_picks(folder, language=None):
+def auto_apply_review_picks(folder, language=None, method='OpenAI'):
     """Suggestions safe to write before TTS. Skip style nits; keep speaker-id moves."""
     from tools.line_roles import is_asr_stump
 
@@ -217,7 +217,8 @@ def auto_apply_review_picks(folder, language=None):
             picks.append(str(int(item.get('index'))))
         except (TypeError, ValueError):
             continue
-    return picks
+    from tools.rewrite_validation import validate_rewrites
+    return validate_rewrites(folder, language or 'English', picks, method)
 
 
 def applied_review_indices(folder, language=None):
@@ -259,10 +260,10 @@ def _slot_budget_note(line, language):
     if uses_word_budget(language):
         budget = _spoken_word_budget(duration, language)
         unit = 'syllables' if translation_language(language) == 'Vietnamese' else 'words'
-        return f'{duration:.1f}s, max {budget} {unit}'
+        return f'{duration:.1f}s, estimated {budget} {unit} (soft target)'
     if uses_char_budget(language):
         budget = _spoken_char_budget(duration, language)
-        return f'{duration:.1f}s, max {budget} characters'
+        return f'{duration:.1f}s, estimated {budget} characters (soft target)'
     return f'{duration:.1f}s'
 
 
@@ -346,6 +347,10 @@ def _voice_table(folder):
 
 
 def review_status_line(folder, language=None):
+    from tools.review_state import warning
+    incomplete = warning(folder, language)
+    if incomplete:
+        return incomplete
     findings = _findings(folder, language)
     if not findings:
         report = load_review(folder, language)
@@ -564,19 +569,8 @@ def apply_selected_review(folder, language, selected, review_table=None):
     if applied:
         write_translation(folder, transcript, language)
         _clear_mix_outputs(folder, keep_video=True)
-        if applied_new:
-            from tools.translation import tighten_overlong_lines
-            _summary, transcript = tighten_overlong_lines(
-                folder, language, indices=applied_new, slack=2,
-            )
-            by_lookup = {int(item.get('index')): item for item in by_index.values() if item.get('index') is not None}
-            for idx in applied_new:
-                text = ''
-                if 0 <= idx < len(transcript):
-                    text = str(transcript[idx].get('translation') or '').strip()
-                row = by_lookup.get(idx) or by_index.get(idx)
-                if row and text:
-                    row['suggest'] = text
+        # Applying a reviewed suggestion must preserve its exact wording.
+        # Word estimates cannot justify silently replacing it with another draft.
         report['findings'] = sorted(
             by_index.values(),
             key=lambda row: (_SEVERITY_RANK.get(row.get('severity'), 9), row.get('index', 0)),
@@ -589,8 +583,6 @@ def apply_selected_review(folder, language, selected, review_table=None):
         parts.append(f'併回 {merged_n} 張被切錯的卡片')
     if skipped:
         parts.append(f'略過 {skipped} 條（沒有建議譯文或句號不對）')
-    if applied_new:
-        parts.append('過長建議已收緊到原句秒數')
     parts.append('譯文已寫入，尚未重配。成片仍留在資料夾；要聽新聲音請按「只重配音」。')
     message = '。'.join(parts)
     logger.info(message)
@@ -648,6 +640,8 @@ def review_folder(folder, target_language=None, method='OpenAI', progress_callba
         'applied': False,
         'findings': findings,
     }
+    from tools.review_state import failures
+    report['complete'] = not failures(folder, language)
     write_review_report(folder, language, report)
     _progress(progress_callback, f'審稿寫入 {len(findings)} 條、未改譯文')
     return report
@@ -1151,6 +1145,8 @@ def _review_model_kwargs(timeout=None):
 
 
 def _continuity_review(transcript, language, summary, method, progress_callback=None, folder=None):
+    from tools.review_state import begin_stage, failed
+    begin_stage(folder, language, '整集連貫')
     if not transcript:
         return []
     from tools.translation_backends import llm_translate
@@ -1160,9 +1156,9 @@ def _continuity_review(transcript, language, summary, method, progress_callback=
     system = (
         review_system_preamble(language) +
         'This pass is whole-episode continuity. '
-        'The Chinese source outline is the plot of record. The English outline may omit beats. '
-        'Do not change a fact that appears in the Chinese line or source outline '
-        'just to match a shorter English outline. '
+        'Both generated outlines are provisional context. Original dialogue and independent '
+        'caption evidence are authoritative. Never delete or invent a fact to make a spoken '
+        'line agree with a generated outline, including claims that words are ASR noise. '
         'Also flag inconsistent name spellings, wrong addressee, plot contradiction, '
         'or wording the Chinese line does not say. '
         'You MAY flag a wrong speaker ID when Chinese wording + outline + neighbors '
@@ -1203,8 +1199,9 @@ def _continuity_review(transcript, language, summary, method, progress_callback=
             )
         except Exception as exc:
             logger.warning(f'整集連貫審核失敗：{exc}')
+            failed(folder, language, '整集連貫', exc)
             continue
-        for item in _parse_ai_findings(raw, allowed):
+        for item in _parse_review_batch(raw, allowed, folder, language, '整集連貫'):
             item['via'] = 'continuity'
             issue = (item.get('issue') or '').strip()
             known = {str(line.get('speaker') or '') for line in transcript}
@@ -1227,6 +1224,8 @@ def _continuity_review(transcript, language, summary, method, progress_callback=
 
 def _ship_qc_review(transcript, language, summary, method, progress_callback=None, folder=None):
     """Whole-table shipping QC: same view a human editor uses after a first pass."""
+    from tools.review_state import begin_stage, failed
+    begin_stage(folder, language, '整表品管')
     if not transcript:
         return []
     from tools.translation_backends import llm_translate
@@ -1241,17 +1240,17 @@ def _ship_qc_review(transcript, language, summary, method, progress_callback=Non
         '(RUSH=too many words for the slot, EMPTY=no dub, STUMP/SKIP=ASR scrap, HAN=leftover Chinese, '
         'GLUE=two mouths in one line, TECHNIQUE=spell/move name crushed, '
         'GUESS=trail-off or yes-then-no stammer was finished, '
-        'SENSE=dropped verb, gun for a spear, river for a realm, or Heaven without Earth, '
+        'SENSE=possible loss or change of meaning, '
         'JUNK=glossary name stamped on ASR hash, '
         'FOREIGN=Latin-script or kana source in a Chinese episode). '
-        'The Chinese source outline is the plot of record. Use the glossary for names. '
+        'Original dialogue takes precedence over automatically inferred outlines. Use the current target glossary for names. '
         'Flag only problems that would fail a watch-through. '
-        'RUSH: rewrite to max words without wrecking the person; Fish is slower than reading. '
+        'RUSH: seek a natural shorter line; preserve the complete meaning if no such line exists. '
         'Do not invent dub for STUMP/SKIP cards. '
         'Do not flag an intentional repeat if the outline says the line is shouted more than once. '
         'Voice-bank role labels are stock-voice age tags, not character sheets; '
         'only mention them if the outline clearly contradicts adult vs child. '
-        'Leave suggest empty ONLY for STUMP/SKIP scrap with no honest dub. '
+        'Leave suggest empty when the evidence does not support a safe complete rewrite. '
         'issue must be Traditional Chinese, one short sentence starting with 品管： '
         'Output JSON only: {"findings":[{"index":0,"severity":"high|mid|low","issue":"品管：…","suggest":"…","suggest_speaker":"SPEAKER_A"}]}'
     )
@@ -1286,8 +1285,9 @@ def _ship_qc_review(transcript, language, summary, method, progress_callback=Non
             )
         except Exception as exc:
             logger.warning(f'整表品管失敗：{exc}')
+            failed(folder, language, '整表品管', exc)
             continue
-        for item in _parse_ai_findings(raw, allowed):
+        for item in _parse_review_batch(raw, allowed, folder, language, '整表品管'):
             item['via'] = 'ship'
             issue = (item.get('issue') or '').strip()
             known = {str(line.get('speaker') or '') for line in transcript}
@@ -1309,6 +1309,8 @@ def _ship_qc_review(transcript, language, summary, method, progress_callback=Non
 
 
 def _ai_review(transcript, language, summary, suspects, method, progress_callback=None, folder=None):
+    from tools.review_state import begin_stage, failed
+    begin_stage(folder, language, '單句審稿')
     if not suspects:
         _progress(progress_callback, '單句 AI：沒有可疑句，略過')
         return []
@@ -1358,27 +1360,44 @@ def _ai_review(transcript, language, summary, suspects, method, progress_callbac
             )
         except Exception as exc:
             logger.warning(f'審稿模型失敗：{exc}')
+            failed(folder, language, '單句審稿', exc)
             continue
-        findings.extend(_parse_ai_findings(raw, chunk))
+        findings.extend(_parse_review_batch(raw, chunk, folder, language, '單句審稿'))
     _progress(progress_callback, f'單句 AI 完成，標出 {len(findings)} 條')
     return findings
 
 
-def _parse_ai_findings(raw, allowed):
+def _parse_review_batch(raw, allowed, folder, language, stage):
+    from tools.review_state import failed
+    try:
+        return _parse_ai_findings(raw, allowed, strict=True)
+    except ValueError as exc:
+        failed(folder, language, stage, exc)
+        logger.warning(f'{stage}回傳格式錯誤；不視為零項問題')
+        return []
+
+
+def _parse_ai_findings(raw, allowed, strict=False):
     text = (raw or '').strip()
     if text.startswith('```'):
         text = re.sub(r'^```(?:json)?', '', text).rstrip('`').strip()
     start = text.find('{')
     end = text.rfind('}')
     if start < 0 or end <= start:
+        if strict:
+            raise ValueError('審稿回傳缺少 JSON')
         return []
     try:
         data = json.loads(text[start:end + 1])
     except Exception:
+        if strict:
+            raise ValueError('審稿回傳不是有效 JSON') from None
         logger.warning('審稿回傳不是 JSON，略過這批')
         return []
     rows = data.get('findings') if isinstance(data, dict) else data
     if not isinstance(rows, list):
+        if strict:
+            raise ValueError('審稿回傳缺少 findings 陣列')
         return []
     allowed_set = set(allowed)
     out = []
@@ -1516,7 +1535,7 @@ def _after_dub_row(folder, index, line, language, transcript=None):
     wav_s = f'{wav:.2f}' if wav is not None else '?'
     return (
         f'#{index} {line.get("speaker") or ""} slot={slot:.2f}s wav={wav_s}s late={late:.2f}s '
-        f'words={words} max={budget} [{",".join(flags) or "-"}] | '
+        f'words={words} estimated_words={budget} audio_source={line.get("audio_source", "tts")} [{",".join(flags) or "-"}] | '
         f'SRC: {line.get("text") or ""} | DUB: {dub}'
     )
 
@@ -1548,6 +1567,8 @@ def _after_dub_suspects(folder, transcript, language):
 
 
 def _after_dub_ai(folder, transcript, language, summary, suspects, method, progress_callback=None):
+    from tools.review_state import begin_stage, failed
+    begin_stage(folder, language, '配音後審稿')
     if not suspects:
         _progress(progress_callback, '配音後 AI：沒有可疑句，略過')
         return []
@@ -1558,7 +1579,11 @@ def _after_dub_ai(folder, transcript, language, summary, suspects, method, progr
         review_system_preamble(language) +
         'This pass is after Fish. Each row has picture slot, actual WAV length, and late versus the Chinese. '
         'WAV_RUSH: wav longer than the picture — shorten THIS spoken line only if a natural shorter line exists. '
-        'Do not rewrite particle-only cards (嘿嘿/呵/哼/嗯/哈哈). The mixer fades those. '
+        'Do not rewrite particle-only cards just to meet timing estimates. '
+        'Rows marked original_laughter already use the original audio; do not rewrite their '
+        'captions to adjust timing. Generated outlines are fallible summaries, not independent '
+        'evidence: never delete an address, instruction, or clause from the supplied source '
+        'merely because an outline calls it noise or leaves it out. '
         'LATE: starts after the picture. Shorten only if it is also WAV_RUSH. '
         'If it is late only because a previous laugh overran, leave suggest empty. '
         'HAN: leftover Chinese. EMPTY: fill a short vocalization. '
@@ -1566,11 +1591,18 @@ def _after_dub_ai(folder, transcript, language, summary, suspects, method, progr
         'FOREIGN: do not invent another language. '
         'TECHNIQUE: restore the distinctive name/clauses; do not crush further. '
         'GUESS: restore the trail-off or yes-then-no stammer; do not replace it with a confession. '
-        'SENSE: put the verb back; a spear is not a gun; a realm homophone is not a river; '
-        'Heaven and Earth stay together; a titled hero keeps the place. '
+        'SENSE: verify the whole meaning against the source and nearby dialogue. '
         'JUNK: do not stamp a glossary name onto ASR hash. '
-        'Do not rewrite a line that already fits (no WAV_RUSH, late < 0.8s) unless '
-        'HAN/EMPTY/GLUE/FOREIGN/TECHNIQUE/GUESS/SENSE/JUNK. '
+        'Timing flags are hints, not a whitelist of defects. Even a line that fits can '
+        'lose meaning, damage a joke, or sound unnatural. Review these against the source '
+        'and provide a safe rewrite when needed. '
+        'Before proposing a shorter line, compare each source proposition: actor, action, '
+        'object, negation, alternatives, quantities, conditions and endpoints. Retain every '
+        'one, including parallel contrasts and the logic connecting them. Do not replace '
+        'concrete people or actions with vague abstractions. Read the candidate as spoken '
+        'dialogue; reject grammatical fragments caused by compression. Word counts are '
+        'soft estimates, never acceptance limits. Leave suggest empty when no faithful '
+        'natural shorter line exists. '
         'Do not flag speaker IDs or Chinese segmentation. '
         'WAV_RUSH and LATE are mid or high, never low. '
         'Leave suggest empty if the only shorter option is a bark or broken English; '
@@ -1613,8 +1645,9 @@ def _after_dub_ai(folder, transcript, language, summary, suspects, method, progr
             )
         except Exception as exc:
             logger.warning(f'配音後審稿失敗：{exc}')
+            failed(folder, language, '配音後審稿', exc)
             continue
-        for item in _parse_ai_findings(raw, chunk):
+        for item in _parse_review_batch(raw, chunk, folder, language, '配音後審稿'):
             item['via'] = 'after_dub'
             issue = (item.get('issue') or '').strip()
             if issue and not issue.startswith('配音後'):
@@ -1626,7 +1659,7 @@ def _after_dub_ai(folder, transcript, language, summary, suspects, method, progr
 
 
 def _keep_after_dub_finding(folder, transcript, item, language):
-    """Drop neighbor nits and bark-style rewrites; layout can delay instead."""
+    """Keep semantic findings even without timing flags; guard unsafe rewrites."""
     try:
         index = int(item.get('index'))
     except (TypeError, ValueError):
@@ -1656,7 +1689,9 @@ def _keep_after_dub_finding(folder, transcript, item, language):
         return True
     needs = any(flag in flags for flag in ('WAV_RUSH', 'LATE'))
     if not needs:
-        return False
+        if suggest and suggest_wrecks_voice(src, current, suggest, language):
+            item['suggest'] = ''
+        return True
     if not suggest:
         return False
     if suggest_wrecks_voice(src, current, suggest, language) and not restores_voice(
@@ -1707,19 +1742,21 @@ def review_after_dub(folder, language=None, method='OpenAI', progress_callback=N
         'suspect_count': len(suspects),
         'findings': findings,
     }
+    from tools.review_state import failures
+    report['complete'] = not failures(folder, language)
     write_review_report(folder, language, report)
     return report
 
 
-def _after_dub_fingerprint(transcript):
-    import hashlib
-
+def _after_dub_fingerprint(transcript, folder=None):
+    from tools.dubbing_settings import fingerprint, file_identity
     parts = []
     for i, line in enumerate(transcript or []):
-        parts.append(
-            f"{i}\t{line.get('speaker') or ''}\t{(line.get('translation') or '').strip()}"
-        )
-    return hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest()[:16]
+        parts.append({key: line.get(key) for key in (
+            'speaker', 'text', 'translation', 'orig_start', 'orig_end', 'start', 'end')})
+        if folder:
+            parts[-1]['wav'] = file_identity(os.path.join(folder, 'wavs', f'{i:04d}.wav'))
+    return fingerprint({'policy_version': 3, 'lines': parts})
 
 
 def _after_dub_stamp_lang(folder, language):
@@ -1730,6 +1767,9 @@ def _after_dub_stamp_lang(folder, language):
 
 def after_dub_already_done(folder, language=None):
     """True when this language's current translations already had a post-TTS review."""
+    from tools.review_state import failures
+    if failures(folder, language):
+        return False
     from tools.translation_versions import load_lines_for_language
 
     lang = _after_dub_stamp_lang(folder, language)
@@ -1737,11 +1777,14 @@ def after_dub_already_done(folder, language=None):
     if not transcript:
         return False
     stamps = load_dub_meta(folder).get('after_dub') or {}
-    return str(stamps.get(lang) or '') == _after_dub_fingerprint(transcript)
+    return str(stamps.get(lang) or '') == _after_dub_fingerprint(transcript, folder)
 
 
 def stamp_after_dub(folder, language=None):
     """Remember this draft so the next redub does not call the review API again."""
+    from tools.review_state import failures
+    if failures(folder, language):
+        return
     from tools.translation_versions import load_lines_for_language
 
     lang = _after_dub_stamp_lang(folder, language)
@@ -1751,7 +1794,7 @@ def stamp_after_dub(folder, language=None):
     path = os.path.join(folder, 'dub_meta.json')
     meta = load_dub_meta(folder)
     stamps = dict(meta.get('after_dub') or {})
-    stamps[lang] = _after_dub_fingerprint(transcript)
+    stamps[lang] = _after_dub_fingerprint(transcript, folder)
     meta['after_dub'] = stamps
     os.makedirs(folder, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as handle:
@@ -1768,7 +1811,7 @@ def review_and_redub_after_tts(folder, language, method='OpenAI'):
         mark_stage('配音後審稿...')
         report = review_after_dub(folder, language, method=method)
         n = len((report or {}).get('findings') or [])
-        picks = auto_apply_review_picks(folder, language)
+        picks = auto_apply_review_picks(folder, language, method=method)
         if picks:
             _, applied, _skipped, message, _ = apply_selected_review(
                 folder, language, picks,
@@ -1786,4 +1829,6 @@ def review_and_redub_after_tts(folder, language, method='OpenAI'):
         if isinstance(exc, JobStopped):
             raise
         logger.warning(f'配音後審稿略過：{exc}')
+        from tools.review_state import failed
+        failed(folder, language, '配音後審稿', exc)
         return False
