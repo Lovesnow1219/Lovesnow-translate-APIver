@@ -578,3 +578,27 @@ def test_asr_merge_text_and_timing_are_applied_together(monkeypatch, tmp_path, g
         assert result[0]['orig_end'] == 2 + gap
     else:
         assert result == original
+
+
+@pytest.mark.parametrize('source,translation,language', [
+    ('嘿嘿嘿', 'Heh-heh-heh.', 'English'),
+    ('呵呵', 'Heh.', 'English'),
+    ('嗯', 'うん。', 'Japanese'),
+])
+def test_standalone_interjections_do_not_gain_a_second_lead(source, translation, language):
+    from tools.vocal_particles import ensure_particle_translation_lead, particle_lead_in
+    row = line(0, 1, source, translation)
+    assert particle_lead_in(source, language) == ''
+    for _ in range(3):
+        ensure_particle_translation_lead(row, language)
+    assert row['translation'] == translation
+
+
+def test_interjection_lead_still_applies_once_to_a_full_sentence():
+    from tools.vocal_particles import ensure_particle_translation_lead, particle_lead_in
+    row = line(0, 2, '嗯，你先走吧。', 'You go ahead.')
+    lead = particle_lead_in(row['text'], 'English')
+    assert lead
+    ensure_particle_translation_lead(row, 'English')
+    ensure_particle_translation_lead(row, 'English')
+    assert row['translation'] == lead + 'You go ahead.'
